@@ -285,6 +285,80 @@ class DailyRangeWaitTestCase(unittest.TestCase):
         self.assertFalse(scraper._expand_daily_range_to_30_days())
 
 
+class AccountSwitchRefreshTestCase(unittest.TestCase):
+    def test_balance_signature_ignores_synthetic_observed_at(self):
+        class FakeDriver:
+            current_url = "https://95598.cn/osgweb/userAcc"
+
+        scraper = Scraper(driver=FakeDriver(), wait_seconds=1, settle_seconds=0)
+        scraper._snapshot = Mock(side_effect=[
+            {
+                "store": {
+                    "state": {
+                        "balance": {
+                            "consNo": "1234567890698",
+                            "accountBalance": "21.0",
+                        }
+                    }
+                },
+                "components": [],
+            },
+            {
+                "store": {
+                    "state": {
+                        "balance": {
+                            "consNo": "1234567890698",
+                            "accountBalance": "21.0",
+                        }
+                    }
+                },
+                "components": [],
+            },
+        ])
+
+        first = scraper._business_signature("账户余额")
+        second = scraper._business_signature("账户余额")
+
+        self.assertEqual(first, "(21.0, None, None)")
+        self.assertEqual(second, first)
+
+    def test_select_account_waits_for_balance_payload_refresh(self):
+        class FakeElement:
+            def get_attribute(self, name):
+                return ""
+
+            def is_displayed(self):
+                return True
+
+        class FakeDriver:
+            current_url = "https://95598.cn/osgweb/userAcc"
+
+            def find_elements(self, by, value):
+                return [FakeElement()]
+
+            def execute_script(self, script, element):
+                return None
+
+            def implicitly_wait(self, value):
+                return None
+
+        scraper = Scraper(driver=FakeDriver(), wait_seconds=1, settle_seconds=0)
+        scraper._open_account_selector = Mock(return_value=True)
+        scraper._account_option_no = Mock(return_value="1234567892485")
+        scraper._wait_for_selected_account = Mock(return_value=True)
+        scraper._business_signature = Mock(return_value="(21.0, 21.0, 0.0)")
+        scraper._wait_for_business_ready = Mock()
+
+        with patch("sgcc_ha_bridge.scraper.time.sleep", return_value=None):
+            selected = scraper._select_account(account_no="1234567892485")
+
+        self.assertTrue(selected)
+        scraper._wait_for_business_ready.assert_called_once_with(
+            "账户余额",
+            "(21.0, 21.0, 0.0)",
+        )
+
+
 class SnapshotModeTestCase(unittest.TestCase):
     def test_debug_full_snapshot_is_recorded_but_not_parsed(self):
         class FakeDriver:
