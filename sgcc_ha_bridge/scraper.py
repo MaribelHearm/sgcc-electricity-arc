@@ -556,7 +556,18 @@ class Scraper:
             parsed = None
 
         if label == "账户余额":
-            return repr(parsed.balance) if parsed is not None and parsed.balance is not None else None
+            if parsed is None or parsed.balance is None:
+                return None
+            # ``observed_at`` is generated at snapshot time when SGCC omits a
+            # business timestamp, so including the whole dataclass makes an
+            # unchanged/stale balance look refreshed on every poll.  Only use
+            # the actual amount fields when waiting for an account switch to
+            # finish updating the balance component.
+            return repr((
+                parsed.balance.balance_cny,
+                parsed.balance.prepay_balance_cny,
+                parsed.balance.arrears_cny,
+            ))
         if label == "电量电费查询":
             if self._has_visible_text("月度电费") or self._has_visible_text("日用电量"):
                 return f"usage-tabs:{self.driver.current_url}"
@@ -673,6 +684,13 @@ class Scraper:
         return result
 
     def _select_account(self, account_no: str = "", fallback_index: Optional[int] = None) -> bool:
+        current_url = self._safe_current_url()
+        on_balance_page = BALANCE_URL.split("/osgweb", 1)[-1] in current_url
+        previous_balance_signature = (
+            self._business_signature("账户余额")
+            if account_no and on_balance_page
+            else None
+        )
         with self._optional_probe():
             if not self._open_account_selector():
                 return False
@@ -702,7 +720,16 @@ class Scraper:
         if not account_no:
             time.sleep(self.settle_seconds)
             return True
-        return self._wait_for_selected_account(account_no)
+        if not self._wait_for_selected_account(account_no):
+            return False
+        if on_balance_page:
+            # The selector identity changes before the asynchronously loaded
+            # balance does.  Waiting for the amount payload to change prevents
+            # the previous household's balance from being assigned to the new
+            # account and gives SGCC time to persist the switch before the
+            # scraper navigates to the usage route.
+            self._wait_for_business_ready("账户余额", previous_balance_signature)
+        return True
 
     def _account_option_no(self, option) -> str:
         try:
