@@ -99,6 +99,33 @@ def test_network_recorder_rejects_unrelated_hosts():
     assert recorder._responses == {}
 
 
+def test_login_recorder_never_reads_document_response_body():
+    recorder = NetworkRecorder(
+        FakeDriver(),
+        allowed_hosts={"95598.cn"},
+        unscoped_metadata_only=True,
+    )
+    sent = []
+    recorder._send = lambda method, params=None: sent.append((method, params))
+    recorder.set_scope(CaptureScope.create("登录后页面", "1234567890123"))
+    recorder._handle_event("Network.responseReceived", {
+        "requestId": "document-1",
+        "type": "Document",
+        "response": {
+            "url": "https://95598.cn/osgweb/userAcc",
+            "status": 200,
+            "mimeType": "text/html",
+        },
+    })
+    recorder._handle_event("Network.loadingFinished", {
+        "requestId": "document-1",
+        "encodedDataLength": 100,
+    })
+
+    assert sent == []
+    assert recorder.observations() == []
+
+
 def test_network_loading_failed_discards_pending_metadata():
     recorder = NetworkRecorder(FakeDriver(), allowed_hosts={"95598.cn"})
     recorder._handle_event("Network.responseReceived", {

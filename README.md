@@ -127,6 +127,8 @@ SGCC_DEBUG=true
 
 ```text
 /data/debug/latest/summary.txt
+/data/debug/latest/browser-runtime.json
+/data/debug/latest/login-network.json
 /data/debug/latest/observations.redacted.json
 /data/debug/latest/parser-decisions.json
 /data/debug/latest/sgcc-debug-bundle.zip

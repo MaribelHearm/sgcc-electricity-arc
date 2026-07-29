@@ -5,12 +5,13 @@ import random
 import time
 from typing import Optional
 
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.common.exceptions import TimeoutException
 
-from .captcha_selenium import solve_captcha_in_browser
+from .captcha_selenium import has_captcha_in_browser, solve_captcha_in_browser
 from .login_guard import LoginFailure, classify_login_failure, env_bool
 from .config import FetcherConfig
 from .const import LOGIN_URL, get_data_dir
@@ -19,12 +20,54 @@ from .login_interaction import build_login_interaction, read_sms_code
 from .redact import mask_secret, redact_text
 
 
+ACCOUNT_LOGIN_SELECTOR = "#login_box .account-login"
+PASSWORD_FORM_SELECTOR = "#login_box .account-login .password_form"
+PASSWORD_TAB_SELECTOR = "#login_box .selectlogin-type .password_login"
+PASSWORD_TERMS_SELECTOR = (
+    "#login_box .account-login .password_form .checked-box.un-checked"
+)
+PHONE_CODE_REQUEST_SELECTOR = "#login_box a.yanzheng"
+
+
 class SgccLogin:
-    def __init__(self, driver, username: str, password: str, config: FetcherConfig):
+    def __init__(
+        self,
+        driver,
+        username: str,
+        password: str,
+        config: FetcherConfig,
+        diagnostic=None,
+    ):
         self.driver = driver
         self._username = username
         self._password = password
         self.config = config
+        self.diagnostic = diagnostic
+
+    def _record_debug_event(
+        self,
+        event: str,
+        *,
+        capture_browser: bool = False,
+        **details,
+    ) -> None:
+        diagnostic = getattr(self, "diagnostic", None)
+        if diagnostic is None:
+            return
+        try:
+            diagnostic.record_timeline(f"login_{event}", **details)
+            if capture_browser:
+                from .browser import collect_browser_runtime
+
+                diagnostic.record_browser_runtime(
+                    f"login_{event}",
+                    collect_browser_runtime(
+                        self.driver,
+                        stage=f"login_{event}",
+                    ),
+                )
+        except Exception as error:
+            logging.warning(f"记录登录 Debug 事件失败: {redact_text(error)}")
 
     @staticmethod
     def is_logged_in_page(driver) -> bool:
@@ -55,9 +98,16 @@ class SgccLogin:
     @ErrorWatcher.watch
     def login(self, phone_code=False, allow_fallback: bool = True, fallback_methods: Optional[list[str]] = None) -> bool:
         driver = self.driver
+        self._record_debug_event(
+            "started",
+            method="phone-code" if phone_code else "password",
+            fallback_enabled=allow_fallback,
+        )
         try:
             self._safe_get(driver, LOGIN_URL, "登录页面")
+            self._record_debug_event("page_loaded", capture_browser=True)
             if self.is_logged_in_page(driver):
+                self._record_debug_event("already_authenticated")
                 logging.info(f"打开登录页后检测到已登录态: {driver.current_url}")
                 return True
             try:
@@ -85,12 +135,11 @@ class SgccLogin:
 
         element = WebDriverWait(driver, self.config.DRIVER_IMPLICITY_WAIT_TIME).until(
             EC.presence_of_element_located((By.CLASS_NAME, 'user')))
-        driver.execute_script("arguments[0].click();", element)
-        logging.info("已找到 'user' 元素。\r")
-        self._click_button(driver, By.XPATH, '//*[@id="login_box"]/div[1]/div[1]/div[2]/span')
+        logging.info("已找到 'user' 元素，准备切换账号登录。\r")
+        self._ensure_password_login_form(driver, element)
         time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT)
         # 点击同意按钮
-        self._click_button(driver, By.XPATH, '//*[@id="login_box"]/div[2]/div[1]/form/div[1]/div[3]/div/span[2]')
+        self._click_button(driver, By.CSS_SELECTOR, PASSWORD_TERMS_SELECTOR)
         logging.info("已点击同意选项。\r")
         time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT)
         if phone_code:
@@ -99,13 +148,14 @@ class SgccLogin:
         elif self._password is not None and len(self._password) > 0:
             # 输入用户名和密码
             input_elements = driver.find_elements(By.CLASS_NAME, "el-input__inner")
-            input_elements[0].send_keys(self._username)
+            self._type_text(input_elements[0], self._username)
             logging.info(f"已输入用户名: {mask_secret(self._username)}\r")
-            input_elements[1].send_keys(self._password)
+            self._type_text(input_elements[1], self._password)
             logging.info("已输入密码: ***MASKED***\r")
 
             # 点击登录按钮
             self._click_button(driver, By.CLASS_NAME, "el-button.el-button--primary")
+            self._record_debug_event("password_submitted", capture_browser=True)
             time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT * 2)
             logging.info("已点击登录按钮。\r")
 
@@ -118,7 +168,13 @@ class SgccLogin:
             error = self._get_error_message(driver, "//div[@class='errmsg-tip']//span")
             if error is None:
                 # 处理腾讯点击验证码
+                self._record_debug_event("password_captcha_started")
                 captcha_passed = solve_captcha_in_browser(driver, max_retries=self.config.RETRY_TIMES_LIMIT)
+                self._record_debug_event(
+                    "password_captcha_finished",
+                    capture_browser=True,
+                    passed=captcha_passed,
+                )
                 if captcha_passed:
                     time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT)
                     if driver.current_url != LOGIN_URL:
@@ -153,6 +209,12 @@ class SgccLogin:
                         return True
                     raise LoginFailure(category, error)
             else:
+                self._record_debug_event(
+                    "password_rejected",
+                    capture_browser=True,
+                    category=classify_login_failure(error),
+                    error=error,
+                )
                 logging.error(f"登录失败: [{error}]\r")
                 category = classify_login_failure(error)
                 ErrorWatcher.instance().capture(f"login_failed_{category}", error)
@@ -211,9 +273,215 @@ class SgccLogin:
         '''封装点击函数，仅在元素可点击时点击'''
         click_element = driver.find_element(button_search_type, button_search_key)
         WebDriverWait(driver, self.config.DRIVER_IMPLICITY_WAIT_TIME).until(EC.element_to_be_clickable(click_element))
-        driver.execute_script("arguments[0].click();", click_element)
-        # 点击后添加微小随机暂停，模拟人工操作
+        self._click_element(driver, click_element)
         time.sleep(random.uniform(0.1, 0.5))
+
+    def _ensure_password_login_form(self, driver, user_element) -> None:
+        """Switch from QR view and verify the password form actually became visible."""
+        initial_state = self._login_ui_state(driver)
+        self._record_debug_event("ui_state_before_account_switch", **initial_state)
+        if initial_state["password_form_visible"]:
+            logging.info("密码登录表单已显示，无需重复切换登录标签。\r")
+            self._record_debug_event(
+                "password_form_ready",
+                switch_method="already-visible",
+            )
+            return
+
+        if not initial_state["account_login_visible"]:
+            switch_method = self._click_until_visible(
+                driver,
+                user_element,
+                ACCOUNT_LOGIN_SELECTOR,
+                label="账号登录入口",
+            )
+            if switch_method is None:
+                state = self._login_ui_state(driver)
+                self._record_debug_event(
+                    "account_switch_failed",
+                    capture_browser=True,
+                    **state,
+                )
+                raise LoginFailure(
+                    "login_ui_failed",
+                    "点击账号登录入口后密码登录面板未显示",
+                )
+            logging.info(f"账号登录面板已显示，点击方式={switch_method}。\r")
+            self._record_debug_event(
+                "account_switch_succeeded",
+                switch_method=switch_method,
+            )
+
+        if not self._visible_css(driver, PASSWORD_FORM_SELECTOR):
+            try:
+                password_tab = WebDriverWait(driver, 5).until(
+                    EC.visibility_of_element_located(
+                        (By.CSS_SELECTOR, PASSWORD_TAB_SELECTOR)
+                    )
+                )
+            except TimeoutException as error:
+                self._record_debug_event(
+                    "password_tab_missing",
+                    capture_browser=True,
+                    **self._login_ui_state(driver),
+                )
+                raise LoginFailure(
+                    "login_ui_failed",
+                    "账号登录面板已显示但未找到密码登录标签",
+                ) from error
+            switch_method = self._click_until_visible(
+                driver,
+                password_tab,
+                PASSWORD_FORM_SELECTOR,
+                label="密码登录标签",
+            )
+            if switch_method is None:
+                self._record_debug_event(
+                    "password_tab_switch_failed",
+                    capture_browser=True,
+                    **self._login_ui_state(driver),
+                )
+                raise LoginFailure(
+                    "login_ui_failed",
+                    "点击密码登录标签后密码表单未显示",
+                )
+
+        self._record_debug_event(
+            "password_form_ready",
+            **self._login_ui_state(driver),
+        )
+
+    def _click_until_visible(
+        self,
+        driver,
+        element,
+        target_selector: str,
+        *,
+        label: str,
+    ) -> Optional[str]:
+        attempts = (
+            (
+                "native",
+                lambda: ActionChains(driver).move_to_element(element).pause(
+                    random.uniform(0.08, 0.25)
+                ).click().perform(),
+            ),
+            ("webdriver", element.click),
+            (
+                "javascript",
+                lambda: driver.execute_script("arguments[0].click();", element),
+            ),
+        )
+        for method, action in attempts:
+            try:
+                action()
+            except Exception as error:
+                error_detail = redact_text(error)[:500]
+                logging.warning(
+                    f"{label}点击失败，方式={method}, "
+                    f"error={type(error).__name__}: {error_detail}"
+                )
+                self._record_debug_event(
+                    "ui_click_attempt",
+                    label=label,
+                    method=method,
+                    result="error",
+                    error_type=type(error).__name__,
+                    error=error_detail,
+                )
+                continue
+            if self._wait_for_visible_css(driver, target_selector, timeout=2):
+                self._record_debug_event(
+                    "ui_click_attempt",
+                    label=label,
+                    method=method,
+                    result="target-visible",
+                )
+                return method
+            logging.warning(
+                f"{label}点击后页面状态未切换，准备回退下一点击方式: {method}"
+            )
+            self._record_debug_event(
+                "ui_click_attempt",
+                label=label,
+                method=method,
+                result="no-transition",
+            )
+        return None
+
+    @staticmethod
+    def _visible_css(driver, selector: str) -> bool:
+        try:
+            return bool(driver.execute_script("""
+                const element = document.querySelector(arguments[0]);
+                if (!element) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    Number(style.opacity || 1) !== 0 &&
+                    rect.width > 0 &&
+                    rect.height > 0;
+            """, selector))
+        except Exception:
+            return False
+
+    def _wait_for_visible_css(self, driver, selector: str, timeout: float) -> bool:
+        try:
+            WebDriverWait(driver, timeout, poll_frequency=0.2).until(
+                lambda current_driver: self._visible_css(
+                    current_driver,
+                    selector,
+                )
+            )
+            return True
+        except TimeoutException:
+            return False
+
+    def _login_ui_state(self, driver) -> dict[str, bool]:
+        return {
+            "account_login_visible": self._visible_css(
+                driver,
+                ACCOUNT_LOGIN_SELECTOR,
+            ),
+            "password_form_visible": self._visible_css(
+                driver,
+                PASSWORD_FORM_SELECTOR,
+            ),
+            "password_tab_visible": self._visible_css(
+                driver,
+                PASSWORD_TAB_SELECTOR,
+            ),
+        }
+
+    @staticmethod
+    def _click_element(driver, element) -> None:
+        """Prefer a pointer action so the page receives a normal mouse event chain."""
+        try:
+            ActionChains(driver).move_to_element(element).pause(
+                random.uniform(0.08, 0.25)
+            ).click().perform()
+            return
+        except Exception as action_error:
+            logging.warning(f"原生鼠标点击失败，回退 WebElement.click(): {action_error}")
+        element.click()
+
+    @staticmethod
+    def _type_text(element, value: str) -> None:
+        """Type one character at a time instead of injecting a full value instantly."""
+        try:
+            min_delay = float(os.getenv("SGCC_TYPE_DELAY_MIN_SECONDS", "0.04"))
+        except (TypeError, ValueError):
+            min_delay = 0.04
+        try:
+            max_delay = float(os.getenv("SGCC_TYPE_DELAY_MAX_SECONDS", "0.12"))
+        except (TypeError, ValueError):
+            max_delay = 0.12
+        if max_delay < min_delay:
+            min_delay, max_delay = max_delay, min_delay
+        for character in value or "":
+            element.send_keys(character)
+            time.sleep(random.uniform(max(0.0, min_delay), max(0.0, max_delay)))
 
     def _get_error_message(self, driver, path) -> Optional[str]:
         """获取错误信息，如果不存在则返回 None"""
@@ -226,6 +494,35 @@ class SgccLogin:
             return None
         finally:
             driver.implicitly_wait(self.config.DRIVER_IMPLICITY_WAIT_TIME)  # 恢复隐式等待
+
+    def _wait_for_login_submit_state(self, driver, timeout: int = 15) -> tuple[str, Optional[str]]:
+        """Wait for one decisive result after submitting a login form."""
+
+        def observe(d):
+            if self.is_logged_in_page(d):
+                return ("authenticated", None)
+            if has_captcha_in_browser(d):
+                return ("captcha", None)
+            error = self._get_error_message(d, "//div[@class='errmsg-tip']//span")
+            if error:
+                return ("error", error)
+            return False
+
+        try:
+            result = WebDriverWait(driver, timeout).until(observe)
+            if result:
+                return result
+        except Exception:
+            pass
+
+        if self.is_logged_in_page(driver):
+            return ("authenticated", None)
+        if has_captcha_in_browser(driver):
+            return ("captcha", None)
+        error = self._get_error_message(driver, "//div[@class='errmsg-tip']//span")
+        if error:
+            return ("error", error)
+        return ("unknown", None)
 
     def _fallback_login(self, driver, reason: str, methods: Optional[list[str]] = None) -> bool:
         """Try explicitly configured interactive login methods in order."""
@@ -270,55 +567,295 @@ class SgccLogin:
 
     def _phone_code_login(self, driver, reason: str) -> bool:
         logging.info("短信验证码登录开始。")
+        self._record_debug_event("phone_code_started")
         self._click_button(driver, By.XPATH, '//*[@id="login_box"]/div[1]/div[1]/div[3]/span')
         time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT)
         input_elements = driver.find_elements(By.CLASS_NAME, "el-input__inner")
         if len(input_elements) < 4:
             raise LoginFailure("phone_code_page_failed", "短信验证码登录页面输入框不完整")
         input_elements[2].clear()
-        input_elements[2].send_keys(self._username)
+        self._type_text(input_elements[2], self._username)
         logging.info(f"已输入用户名: {mask_secret(self._username)}\r")
-        self._click_button(driver, By.XPATH, '//*[@id="login_box"]/div[2]/div[2]/form/div[1]/div[2]/div[2]/div/a')
+        request_state = self._request_phone_code(driver)
+        self._record_debug_event(
+            "phone_code_requested",
+            request_status=request_state.get("status", ""),
+            auth_time=request_state.get("auth_time", 0),
+        )
 
         interaction = build_login_interaction()
         code = read_sms_code(interaction, reason)
         if not code:
             interaction.notify_result("phone-code", False, "未在有效时间内收到短信验证码")
             raise LoginFailure("phone_code_timeout", "未在有效时间内收到短信验证码")
-        input_elements[3].send_keys(code)
+        self._type_text(input_elements[3], code)
         code = None
         logging.info("已输入手机验证码。\r")
         self._click_button(driver, By.XPATH, '//*[@id="login_box"]/div[2]/div[2]/form/div[2]/div/button/span')
-        time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT * 2)
-        success = self.is_logged_in_page(driver)
+        self._record_debug_event("phone_code_submitted", capture_browser=True)
+        state, error = self._wait_for_login_submit_state(driver)
+        self._record_debug_event(
+            "phone_code_state",
+            capture_browser=True,
+            state=state,
+            error=error or "",
+        )
+
+        if state == "captcha":
+            logging.info("短信验证码提交后出现腾讯人机验证，开始处理。")
+            self._record_debug_event("phone_code_captcha_started")
+            captcha_passed = solve_captcha_in_browser(
+                driver,
+                max_retries=self.config.RETRY_TIMES_LIMIT,
+            )
+            self._record_debug_event(
+                "phone_code_captcha_finished",
+                capture_browser=True,
+                passed=captcha_passed,
+            )
+            if captcha_passed:
+                state, error = self._wait_for_login_submit_state(driver)
+                self._record_debug_event(
+                    "phone_code_post_captcha_state",
+                    capture_browser=True,
+                    state=state,
+                    error=error or "",
+                )
+            else:
+                error = (
+                    self._get_error_message(driver, "//div[@class='errmsg-tip']//span")
+                    or "短信验证码提交后的腾讯人机验证未通过"
+                )
+                interaction.notify_result("phone-code", False, error)
+                raise LoginFailure(
+                    classify_login_failure(error, captcha_failed=True),
+                    error,
+                )
+
+        success = state == "authenticated"
         interaction.notify_result(
             "phone-code",
             success,
-            "登录态已确认" if success else "验证码提交后仍未检测到登录态",
+            "登录态已确认"
+            if success
+            else (
+                error
+                or "短信验证码及人机验证提交后仍未检测到登录态"
+            ),
         )
         if success:
             logging.info("短信验证码登录成功。")
             return True
-        error = self._get_error_message(driver, "//div[@class='errmsg-tip']//span") or "短信验证码提交后仍未登录"
+        error = (
+            error
+            or self._get_error_message(driver, "//div[@class='errmsg-tip']//span")
+            or "短信验证码及人机验证提交后仍未登录"
+        )
         raise LoginFailure(classify_login_failure(error), error)
+
+    def _request_phone_code(self, driver) -> dict:
+        """Click the visible send-code control and require a decisive frontend state."""
+        attempts = (
+            (
+                "native",
+                lambda element: ActionChains(driver).move_to_element(element).pause(
+                    random.uniform(0.08, 0.25)
+                ).click().perform(),
+            ),
+            ("webdriver", lambda element: element.click()),
+            (
+                "javascript",
+                lambda element: driver.execute_script(
+                    "arguments[0].click();",
+                    element,
+                ),
+            ),
+        )
+
+        for method, action in attempts:
+            element = self._visible_phone_code_request_element(driver)
+            if element is None:
+                raise LoginFailure(
+                    "phone_code_request_failed",
+                    "未找到可见的获取验证码按钮",
+                )
+            try:
+                action(element)
+            except Exception as error:
+                logging.warning(
+                    "获取短信验证码点击失败，方式=%s, error=%s: %s",
+                    method,
+                    type(error).__name__,
+                    redact_text(error)[:500],
+                )
+                continue
+
+            state = self._wait_for_phone_code_request_state(driver, timeout=3.0)
+            if state["status"] == "sent":
+                logging.info("国网前端已确认短信验证码发送。")
+                return state
+            if state["status"] == "error":
+                raise LoginFailure(
+                    "phone_code_request_failed",
+                    state.get("error") or "国网前端返回短信验证码发送失败",
+                )
+            if state["status"] == "captcha":
+                logging.info("发送短信验证码前出现腾讯人机验证，开始处理。")
+                self._record_debug_event("phone_code_request_captcha_started")
+                passed = solve_captcha_in_browser(
+                    driver,
+                    max_retries=self.config.RETRY_TIMES_LIMIT,
+                )
+                self._record_debug_event(
+                    "phone_code_request_captcha_finished",
+                    capture_browser=True,
+                    passed=passed,
+                )
+                if not passed:
+                    raise LoginFailure(
+                        "captcha_failed",
+                        "发送短信验证码前的腾讯人机验证未通过",
+                    )
+                state = self._wait_for_phone_code_request_state(
+                    driver,
+                    timeout=10.0,
+                )
+                if state["status"] == "sent":
+                    logging.info("人机验证通过，国网前端已确认短信验证码发送。")
+                    return state
+                if state["status"] == "error":
+                    raise LoginFailure(
+                        "phone_code_request_failed",
+                        state.get("error") or "人机验证通过后短信验证码发送失败",
+                    )
+
+            logging.warning(
+                "获取验证码点击后前端未确认发送，准备回退下一点击方式: %s",
+                method,
+            )
+
+        raise LoginFailure(
+            "phone_code_request_failed",
+            "点击获取验证码后前端未确认短信已发送",
+        )
+
+    @staticmethod
+    def _visible_phone_code_request_element(driver):
+        elements = driver.find_elements(By.CSS_SELECTOR, PHONE_CODE_REQUEST_SELECTOR)
+        for element in elements:
+            try:
+                if element.is_displayed() and element.is_enabled():
+                    return element
+            except Exception:
+                continue
+        return None
+
+    def _wait_for_phone_code_request_state(
+        self,
+        driver,
+        *,
+        timeout: float,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        latest = {"status": "pending", "auth_time": 0, "error": ""}
+        while time.monotonic() < deadline:
+            latest = self._phone_code_request_state(driver)
+            if latest["status"] in {"sent", "error"}:
+                return latest
+            if has_captcha_in_browser(driver):
+                return {**latest, "status": "captcha"}
+            time.sleep(0.2)
+        return latest
+
+    @staticmethod
+    def _phone_code_request_state(driver) -> dict:
+        try:
+            state = driver.execute_script("""
+                const seen = new Set();
+                let authTime = 0;
+                let sendAuthCode = null;
+                let codeMsg = '';
+                let validError = '';
+                let sendError = '';
+                let success = false;
+                let errorVisible = false;
+
+                for (const element of document.querySelectorAll('*')) {
+                    let vm = element.__vue__;
+                    while (vm) {
+                        if (!seen.has(vm)) {
+                            seen.add(vm);
+                            const data = vm.$data || {};
+                            if (Number(data.auth_time || 0) > authTime) {
+                                authTime = Number(data.auth_time || 0);
+                            }
+                            if (typeof data.sendAuthCode === 'boolean') {
+                                sendAuthCode = data.sendAuthCode;
+                            }
+                            if (typeof data.codeMsg === 'string' && data.codeMsg) {
+                                codeMsg = data.codeMsg;
+                            }
+                            const message = data.passLoginErrMsg;
+                            if (message && typeof message === 'object') {
+                                validError = String(message.validErr || validError || '');
+                                sendError = String(message.sendErr || sendError || '');
+                                success = Boolean(message.isSucess || success);
+                                errorVisible = Boolean(
+                                    message.isShow || message.isShowCode || errorVisible
+                                );
+                            }
+                        }
+                        vm = vm.$parent;
+                    }
+                }
+
+                const sent = authTime > 0
+                    || sendAuthCode === false
+                    || success
+                    || /验证码已发送|Verification Code has been sent/i.test(validError);
+                const failed = !sent && errorVisible && Boolean(sendError || validError);
+                return {
+                    status: sent ? 'sent' : failed ? 'error' : 'pending',
+                    auth_time: authTime,
+                    code_msg: codeMsg,
+                    error: failed ? (sendError || validError) : '',
+                };
+            """)
+            if isinstance(state, dict):
+                return {
+                    "status": state.get("status", "pending"),
+                    "auth_time": int(state.get("auth_time") or 0),
+                    "code_msg": str(state.get("code_msg") or ""),
+                    "error": str(state.get("error") or ""),
+                }
+        except Exception as error:
+            logging.warning(
+                "读取短信验证码发送状态失败[%s]: %s",
+                type(error).__name__,
+                redact_text(error)[:500],
+            )
+        return {"status": "pending", "auth_time": 0, "code_msg": "", "error": ""}
 
     def _qr_login(self, driver, reason: str) -> bool:
         logging.info("二维码登录开始")
         # 切换验证码
         element = WebDriverWait(driver, self.config.DRIVER_IMPLICITY_WAIT_TIME).until(
             EC.presence_of_element_located((By.CLASS_NAME, 'qr_code')))
-        driver.execute_script("arguments[0].click();", element)
+        self._click_element(driver, element)
         logging.info("已切换到二维码模式")
 
         time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT)
-        # 获取登录二维码
-        qrElement = WebDriverWait(driver, self.config.DRIVER_IMPLICITY_WAIT_TIME).until(
-            EC.visibility_of_element_located((By.XPATH, "//div[@class='sweepCodePic']//img")))
+        qrElement = self._wait_for_fresh_qr_image(driver)
         logging.info("已找到二维码图片元素")
 
-        img_src = qrElement.get_attribute('src')
+        try:
+            img_src = qrElement.get_dom_attribute("src") or ""
+        except Exception:
+            img_src = qrElement.get_attribute("src") or ""
+        if not isinstance(img_src, str):
+            img_src = qrElement.get_attribute("src") or ""
 
-        if img_src.startswith('data:image'):
+        if img_src and img_src.startswith('data:image'):
             base64_data = img_src.split(',')[1]
             img_screenshot = base64.b64decode(base64_data)
         else:
@@ -374,6 +911,77 @@ class SgccLogin:
                 pass
             except OSError as cleanup_error:
                 logging.warning(f"删除登录二维码临时文件失败: {cleanup_error}")
+
+    def _wait_for_fresh_qr_image(self, driver):
+        """Wait for a QR image and refresh the expired placeholder once."""
+        refresh_clicked = False
+        stale_sources = set()
+
+        def image_source(image):
+            try:
+                src = image.get_dom_attribute("src") or ""
+            except Exception:
+                src = image.get_attribute("src") or ""
+            if not isinstance(src, str):
+                src = image.get_attribute("src") or ""
+            return src
+
+        def locate_or_refresh(d):
+            nonlocal refresh_clicked
+            expired_visible = False
+            for container in d.find_elements(By.CSS_SELECTOR, ".sweepCodePic"):
+                try:
+                    text = (container.text or "").strip()
+                    expired_visible = container.is_displayed() and any(
+                        marker in text for marker in ("二维码失效", "重新获取")
+                    )
+                    if expired_visible and not refresh_clicked:
+                        for image in d.find_elements(
+                            By.CSS_SELECTOR,
+                            ".sweepCodePic img",
+                        ):
+                            source = image_source(image)
+                            if source:
+                                stale_sources.add(source)
+                        logging.info("二维码已失效，点击页面重新获取")
+                        refresh_target = container
+                        for overlay in d.find_elements(
+                            By.CSS_SELECTOR,
+                            ".sweepCodePic .erwBg",
+                        ):
+                            if overlay.is_displayed():
+                                refresh_target = overlay
+                                break
+                        self._click_element(d, refresh_target)
+                        refresh_clicked = True
+                except Exception as refresh_error:
+                    logging.warning(f"刷新失效二维码失败: {refresh_error}")
+            if expired_visible:
+                return False
+
+            for image in d.find_elements(By.CSS_SELECTOR, ".sweepCodePic img"):
+                try:
+                    src = image_source(image)
+                    loaded = d.execute_script(
+                        "return Boolean(arguments[0].complete) && "
+                        "Number(arguments[0].naturalWidth || 0) > 0;",
+                        image,
+                    )
+                    if (
+                        image.is_displayed()
+                        and src
+                        and src not in stale_sources
+                        and loaded
+                    ):
+                        return image
+                except Exception:
+                    continue
+            return False
+
+        return WebDriverWait(
+            driver,
+            self.config.DRIVER_IMPLICITY_WAIT_TIME,
+        ).until(locate_or_refresh)
 
     def _random_delay(self, min_seconds=0.5, max_seconds=3.0):
         """添加随机延迟，使自动化操作更难被检测。"""

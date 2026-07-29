@@ -26,4 +26,7 @@ COPY sgcc_ha_bridge/ /app/sgcc_ha_bridge/
 COPY scripts/browser-service-entrypoint.sh /app/browser-service-entrypoint.sh
 RUN chmod +x /app/browser-service-entrypoint.sh
 
+ARG VERSION=unknown
+ENV VERSION=${VERSION}
+
 CMD ["/app/browser-service-entrypoint.sh"]

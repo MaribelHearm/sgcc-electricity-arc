@@ -9,8 +9,9 @@ ENV TZ=Asia/Shanghai
 
 
 ARG TARGETARCH
-ARG VERSION
+ARG SGCC_FORCE_DEBUG=false
 ENV PYTHON_IN_DOCKER='PYTHON_IN_DOCKER'
+ENV SGCC_FORCE_DEBUG=${SGCC_FORCE_DEBUG}
 
 WORKDIR /app
 
@@ -62,6 +63,7 @@ COPY scripts/browser-service-entrypoint.sh /app/browser-service-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh /app/browser-service-entrypoint.sh
 
 ENV LANG=C.UTF-8
+ARG VERSION=unknown
 ENV VERSION=${VERSION}
 
 CMD ["/app/docker-entrypoint.sh"]

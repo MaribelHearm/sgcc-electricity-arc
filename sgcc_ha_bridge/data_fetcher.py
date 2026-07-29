@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Optional
 
-from .browser import build_driver, release_driver
+from .browser import build_driver, collect_browser_runtime, release_driver
 from .cache_validity import has_useful_account_data
 from .config import FetcherConfig
 from .const import LOGIN_URL
@@ -151,6 +151,23 @@ class DataFetcher:
                 publisher = "mqtt"
             if diag is not None:
                 diag.record_runtime(self.config, publisher=publisher, stage="browser_ready")
+                startup_captures = getattr(driver, "_sgcc_browser_runtime", None) or []
+                for snapshot in startup_captures:
+                    diag.record_browser_runtime(
+                        str(snapshot.get("stage") or "driver_ready"),
+                        snapshot,
+                    )
+                network_recorder = NetworkRecorder(
+                    driver,
+                    unscoped_metadata_only=True,
+                )
+                network_started = network_recorder.start()
+                diag.record_timeline(
+                    "login_network_recorder_started",
+                    success=network_started,
+                    cdp_address=network_recorder.cdp_address,
+                    response_bodies=False,
+                )
             updator = SensorUpdator() if publisher in {"rest", "both"} else None
             mqtt_pub = MqttPublisher(self.config) if publisher in {"mqtt", "both"} else None
             mqtt_connected = mqtt_pub.connect() if mqtt_pub is not None else False
@@ -162,7 +179,13 @@ class DataFetcher:
                 diag.record_session("before_login", before_check)
 
             try:
-                login_client = SgccLogin(driver, self._username, self._password, self.config)
+                login_client = SgccLogin(
+                    driver,
+                    self._username,
+                    self._password,
+                    self.config,
+                    diagnostic=diag,
+                )
                 login_method = os.getenv("SGCC_LOGIN_METHOD", "password").strip().lower()
                 allow_fallback = self._allow_login_fallback(trigger_type)
                 if login_method in {"phone-code", "phone_code", "sms"}:
@@ -198,18 +221,30 @@ class DataFetcher:
             session_status_after = after_login_check.status
             if diag is not None:
                 diag.record_session("after_login", after_login_check)
+                diag.record_browser_runtime(
+                    "after_login",
+                    collect_browser_runtime(driver, stage="after_login"),
+                )
 
             if after_login_check.status != "authenticated":
                 raise Exception(f"session not authenticated after login: {after_login_check.status}")
 
-            network_recorder = NetworkRecorder(driver)
-            network_started = network_recorder.start()
-            if diag is not None:
-                diag.record_timeline(
-                    "network_recorder_started",
-                    success=network_started,
-                    cdp_address=network_recorder.cdp_address,
-                )
+            if network_recorder is None or not network_recorder.started:
+                network_recorder = NetworkRecorder(driver)
+                network_started = network_recorder.start()
+                if diag is not None:
+                    diag.record_timeline(
+                        "network_recorder_started",
+                        success=network_started,
+                        cdp_address=network_recorder.cdp_address,
+                    )
+            else:
+                network_started = network_recorder.started
+                if diag is not None:
+                    diag.record_timeline(
+                        "network_recorder_continued_after_login",
+                        success=network_started,
+                    )
 
             self._random_delay(1, 3)
             logging.info("开始使用动态多源 Path B 抓取账户数据。")
@@ -445,6 +480,11 @@ class DataFetcher:
                     logging.warning(f"记录 fetch run 失败状态失败: {redact_text(finish_error)}")
             if diag is not None:
                 diag.record_error(e, stage="fetch")
+                if driver is not None:
+                    diag.record_browser_runtime(
+                        "fetch_failed",
+                        collect_browser_runtime(driver, stage="fetch_failed"),
+                    )
             raise
         finally:
             if network_recorder is not None:
@@ -460,6 +500,11 @@ class DataFetcher:
                         error_count=len(network_recorder.errors),
                     )
             if driver is not None:
+                if diag is not None:
+                    diag.record_browser_runtime(
+                        "before_release",
+                        collect_browser_runtime(driver, stage="before_release"),
+                    )
                 release_driver(driver)
             if "mqtt_pub" in locals() and mqtt_pub is not None:
                 mqtt_pub.disconnect()

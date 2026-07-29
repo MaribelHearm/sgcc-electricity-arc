@@ -79,6 +79,17 @@ SGCC_BROWSER_IMAGE=ghcr.io/maribelhearm/sgcc-home-assistant-bridge-browser:v0.1.
 
 Compose 使用 `browser-service` 时，app/browser 两个镜像建议固定到同一个 tag，避免 app 内 ChromeDriver 与 browser-service Chrome 版本不一致。
 
+browser-service 的 `/status` 会返回镜像 `revision`。主程序每次启动 sidecar 时也会记录
+`app_revision` 和 `browser_revision`；两者都已标记且不一致时会输出警告。排查部署版本时可先执行：
+
+```bash
+curl -s http://127.0.0.1:39222/status
+docker inspect sgcc_electricity_arc --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^VERSION='
+```
+
+正式发布的 app/browser 镜像由同一次 CI 构建注入相同的 Git commit SHA。若使用自建镜像，
+应给两个 Dockerfile 传入相同的 `VERSION` build arg。
+
 也可以继续本地构建：
 
 ```bash
@@ -467,6 +478,8 @@ Debug bundle 默认写入：
 /data/debug/latest/
 ├── summary.txt
 ├── summary.json
+├── browser-runtime.json
+├── login-network.json
 ├── fields.redacted.json
 ├── observations.redacted.json
 ├── candidates.redacted.json
@@ -476,7 +489,13 @@ Debug bundle 默认写入：
 └── sgcc-debug-bundle.zip
 ```
 
+`browser-runtime.json` 记录登录关键阶段的 Chrome/ChromeDriver 版本、User-Agent、`navigator.webdriver`、platform、languages、timezone、screen/window、device pixel ratio、WebGL/GPU 和自动化全局变量等无凭证运行态；不读取 cookie、localStorage、sessionStorage 的值。
+
+`login-network.json` 从 CDP Network 事件记录登录页和登录接口真正发出的白名单请求头，包括 `User-Agent`、`Accept-Language`、`sec-ch-ua`、`sec-ch-ua-platform`、`sec-ch-ua-mobile`，并与 JS 运行态生成一致性检查；同时记录 HTTP 协议、远端地址、连接复用、缓存、TLS 协议/套件及安全时序。登录阶段不读取请求体或响应 body，`Cookie`、`Authorization` 和其他未列入白名单的请求头不会写入取证包。
+
 其中生产 observation 按户号和页面 scope 关联 Network XHR/fetch、Vuex 和受字段契约限制的 Vue Component 数据；必要的严格 DOM label/value 作为生产 fallback。完整受预算约束的 Vue Component `$data` 与额外 DOM 仅写入诊断取证，不进入 parser。Component 快照具有组件级和全局节点预算、深度/数组/字段上限及执行时间上限；截断位置保留在 bundle。parser decision 记录每个来源是接受、拒绝还是 fallback；未知金额只进入候选，不会被猜测发布。
+
+`dev/**` 分支发布的 app 测试镜像构建时设置 `SGCC_FORCE_DEBUG=true`，即使用户配置中的 `SGCC_DEBUG=false` 也会生成上述 bundle；`main`、`latest` 和版本 tag 不强制开启。
 
 金额字段由 `sgcc_ha_bridge/field_contracts.py` 统一登记。新增省份字段需要脱敏 Debug 样本、fixture、字段语义和正负测试；Vue capture 与 parser 共用该注册表，避免分别追加猜测 alias。
 

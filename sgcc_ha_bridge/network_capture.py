@@ -14,10 +14,115 @@ import requests
 from websocket import WebSocketApp
 
 from .observation import CaptureScope, Observation
-from .redact import redact_text
+from .redact import redact_text, redact_url
 
 
 DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024
+_SAFE_REQUEST_HEADERS = {
+    ":authority",
+    ":method",
+    ":scheme",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-type",
+    "dnt",
+    "origin",
+    "pragma",
+    "priority",
+    "referer",
+    "sec-ch-ua",
+    "sec-ch-ua-arch",
+    "sec-ch-ua-bitness",
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-full-version-list",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-model",
+    "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-user",
+    "upgrade-insecure-requests",
+    "user-agent",
+    "x-requested-with",
+}
+_FINGERPRINT_REQUEST_HEADERS = (
+    "user-agent",
+    "accept-language",
+    "sec-ch-ua",
+    "sec-ch-ua-platform",
+    "sec-ch-ua-mobile",
+)
+_BODY_RESOURCE_TYPES = {"XHR", "Fetch"}
+_LOGIN_METADATA_RESOURCE_TYPES = {"Document", "XHR", "Fetch"}
+_SAFE_RESPONSE_TIMING_FIELDS = {
+    "requestTime",
+    "proxyStart",
+    "proxyEnd",
+    "dnsStart",
+    "dnsEnd",
+    "connectStart",
+    "connectEnd",
+    "sslStart",
+    "sslEnd",
+    "workerStart",
+    "workerReady",
+    "workerFetchStart",
+    "workerRespondWithSettled",
+    "sendStart",
+    "sendEnd",
+    "pushStart",
+    "pushEnd",
+    "receiveHeadersStart",
+    "receiveHeadersEnd",
+}
+_SAFE_SECURITY_DETAIL_FIELDS = {
+    "protocol",
+    "keyExchange",
+    "keyExchangeGroup",
+    "cipher",
+    "mac",
+    "serverSignatureAlgorithm",
+    "certificateTransparencyCompliance",
+    "encryptedClientHello",
+}
+
+
+def _safe_request_headers(headers: Any) -> dict[str, str]:
+    if not isinstance(headers, dict):
+        return {}
+    safe: dict[str, str] = {}
+    for raw_name, raw_value in headers.items():
+        name = str(raw_name).strip().lower()
+        if name not in _SAFE_REQUEST_HEADERS:
+            continue
+        value = str(raw_value)
+        if name in {"origin", "referer"}:
+            value = redact_url(value)
+        safe[name] = value[:1024]
+    return safe
+
+
+def _safe_mapping(value: Any, allowed_fields: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value.get(key)
+        for key in allowed_fields
+        if key in value
+    }
+
+
+def _fingerprint_request_headers(headers: Any) -> dict[str, str]:
+    safe_headers = _safe_request_headers(headers)
+    return {
+        name: safe_headers[name]
+        for name in _FINGERPRINT_REQUEST_HEADERS
+        if name in safe_headers
+    }
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -50,6 +155,7 @@ class NetworkRecorder:
         *,
         max_body_bytes: Optional[int] = None,
         allowed_hosts: Optional[set[str]] = None,
+        unscoped_metadata_only: bool = False,
     ):
         self.driver = driver
         self.cdp_address = cdp_address_for_driver(driver)
@@ -64,6 +170,7 @@ class NetworkRecorder:
             if item.strip()
         }
         self.allowed_hosts = allowed_hosts or configured_hosts or {page_host, "95598.cn"}
+        self.unscoped_metadata_only = bool(unscoped_metadata_only)
         self._lock = threading.RLock()
         self._opened = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -71,6 +178,7 @@ class NetworkRecorder:
         self._next_id = 0
         self._body_commands: dict[int, dict[str, Any]] = {}
         self._request_scopes: dict[str, Optional[CaptureScope]] = {}
+        self._request_metadata: dict[str, dict[str, Any]] = {}
         self._responses: dict[str, dict[str, Any]] = {}
         self._observations: list[Observation] = []
         self._current_scope: Optional[CaptureScope] = None
@@ -224,26 +332,98 @@ class NetworkRecorder:
             if request_id and self._allowed_url(url):
                 with self._lock:
                     self._request_scopes[request_id] = self._current_scope
+                    previous = self._request_metadata.get(request_id) or {}
+                    previous_headers = previous.get("headers") or {}
+                    header_sources = set(previous.get("header_sources") or [])
+                    header_sources.add("requestWillBeSent")
+                    previous.update({
+                        "method": request.get("method"),
+                        "resource_type": params.get("type"),
+                        "initiator_type": (params.get("initiator") or {}).get("type"),
+                        "has_post_data": bool(request.get("hasPostData")),
+                        "headers": {
+                            **previous_headers,
+                            **_safe_request_headers(request.get("headers")),
+                        },
+                        "header_sources": sorted(header_sources),
+                    })
+                    self._request_metadata[request_id] = previous
+            elif request_id:
+                with self._lock:
+                    self._request_scopes.pop(request_id, None)
+                    self._request_metadata.pop(request_id, None)
+            return
+
+        if method == "Network.requestWillBeSentExtraInfo":
+            request_id = str(params.get("requestId") or "")
+            if request_id:
+                with self._lock:
+                    previous = self._request_metadata.get(request_id) or {}
+                    header_sources = set(previous.get("header_sources") or [])
+                    header_sources.add("requestWillBeSentExtraInfo")
+                    previous["headers"] = {
+                        **(previous.get("headers") or {}),
+                        **_safe_request_headers(params.get("headers")),
+                    }
+                    previous["header_sources"] = sorted(header_sources)
+                    previous["client_security_state"] = _safe_mapping(
+                        params.get("clientSecurityState"),
+                        {
+                            "initiatorIPAddressSpace",
+                            "privateNetworkRequestPolicy",
+                            "ipAddressSpace",
+                        },
+                    )
+                    self._request_metadata[request_id] = previous
             return
 
         if method == "Network.responseReceived":
             resource_type = str(params.get("type") or "")
-            if resource_type not in {"XHR", "Fetch"}:
+            allowed_resource_types = (
+                _LOGIN_METADATA_RESOURCE_TYPES
+                if self.unscoped_metadata_only
+                else _BODY_RESOURCE_TYPES
+            )
+            if resource_type not in allowed_resource_types:
                 return
             response = params.get("response") or {}
             url = str(response.get("url") or "")
             if not self._allowed_url(url):
+                request_id = str(params.get("requestId") or "")
+                with self._lock:
+                    self._request_scopes.pop(request_id, None)
+                    self._request_metadata.pop(request_id, None)
+                    self._responses.pop(request_id, None)
                 return
             request_id = str(params.get("requestId") or "")
             if not request_id:
                 return
             with self._lock:
                 scope = self._request_scopes.get(request_id, self._current_scope)
+                request_metadata = self._request_metadata.get(request_id) or {}
                 self._responses[request_id] = {
                     "url": url,
                     "status": response.get("status"),
                     "mime_type": response.get("mimeType") or "",
                     "resource_type": resource_type,
+                    "request": request_metadata,
+                    "protocol": response.get("protocol"),
+                    "remote_ip_address": response.get("remoteIPAddress"),
+                    "remote_port": response.get("remotePort"),
+                    "connection_reused": response.get("connectionReused"),
+                    "connection_id": response.get("connectionId"),
+                    "from_disk_cache": response.get("fromDiskCache"),
+                    "from_service_worker": response.get("fromServiceWorker"),
+                    "from_prefetch_cache": response.get("fromPrefetchCache"),
+                    "security_state": response.get("securityState"),
+                    "security_details": _safe_mapping(
+                        response.get("securityDetails"),
+                        _SAFE_SECURITY_DETAIL_FIELDS,
+                    ),
+                    "timing": _safe_mapping(
+                        response.get("timing"),
+                        _SAFE_RESPONSE_TIMING_FIELDS,
+                    ),
                     "scope": scope,
                 }
             return
@@ -253,8 +433,51 @@ class NetworkRecorder:
             encoded_length = int(params.get("encodedDataLength") or 0)
             with self._lock:
                 self._request_scopes.pop(request_id, None)
+                self._request_metadata.pop(request_id, None)
                 metadata = self._responses.pop(request_id, None)
             if not metadata:
+                return
+            if self.unscoped_metadata_only and metadata.get("scope") is None:
+                request_metadata = metadata.get("request") or {}
+                request_headers = request_metadata.get("headers") or {}
+                observation = Observation(
+                    source="network_metadata",
+                    scope_id="login",
+                    scope_label="登录阶段",
+                    payload={
+                        "request": {
+                            **request_metadata,
+                            "fingerprint_headers": _fingerprint_request_headers(
+                                request_headers
+                            ),
+                        },
+                        "response": {
+                            key: metadata.get(key)
+                            for key in (
+                                "status",
+                                "mime_type",
+                                "resource_type",
+                                "protocol",
+                                "remote_ip_address",
+                                "remote_port",
+                                "connection_reused",
+                                "connection_id",
+                                "from_disk_cache",
+                                "from_service_worker",
+                                "from_prefetch_cache",
+                                "security_state",
+                                "security_details",
+                                "timing",
+                            )
+                        },
+                        "encoded_data_length": encoded_length,
+                    },
+                    metadata={"url": metadata.get("url")},
+                )
+                with self._lock:
+                    self._observations.append(observation)
+                return
+            if metadata.get("resource_type") not in _BODY_RESOURCE_TYPES:
                 return
             if encoded_length > self.max_body_bytes:
                 self._record_error(
@@ -270,6 +493,7 @@ class NetworkRecorder:
             request_id = str(params.get("requestId") or "")
             with self._lock:
                 self._request_scopes.pop(request_id, None)
+                self._request_metadata.pop(request_id, None)
                 self._responses.pop(request_id, None)
 
     def _handle_command_result(self, command_id: int, message: dict[str, Any]) -> None:
@@ -305,6 +529,11 @@ class NetworkRecorder:
                 "status": metadata.get("status"),
                 "mime_type": metadata.get("mime_type"),
                 "resource_type": metadata.get("resource_type"),
+                "request": metadata.get("request") or {},
+                "protocol": metadata.get("protocol"),
+                "remote_ip_address": metadata.get("remote_ip_address"),
+                "remote_port": metadata.get("remote_port"),
+                "security_state": metadata.get("security_state"),
             },
         )
         with self._lock:

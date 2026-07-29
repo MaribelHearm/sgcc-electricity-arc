@@ -39,6 +39,30 @@ class BrowserServiceConfigTestCase(unittest.TestCase):
 
         self.assertEqual(browser_service.HOST, "127.0.0.1")
         self.assertEqual(browser_service.CDP_HOST, "127.0.0.1")
+        self.assertEqual(browser_service.START_URL, "about:blank")
+
+    def test_status_payload_exposes_image_revision(self):
+        browser_service = self._load_browser_service(VERSION="commit-abc123")
+
+        self.assertEqual(
+            browser_service._status_payload()["revision"],
+            "commit-abc123",
+        )
+
+    def test_chrome_starts_blank_with_consistent_automation_flags(self):
+        browser_service = self._load_browser_service(
+            BROWSER_LANGUAGE="zh-CN,zh,en-US,en",
+            BROWSER_WINDOW_SIZE="1920,1080",
+        )
+
+        args = browser_service._chrome_args()
+
+        self.assertEqual(args[-1], "about:blank")
+        self.assertIn("--disable-blink-features=AutomationControlled", args)
+        self.assertIn("--lang=zh-CN", args)
+        self.assertIn("--accept-lang=zh-CN,zh,en-US,en", args)
+        self.assertIn("--window-size=1920,1080", args)
+        self.assertNotIn("https://95598.cn/osgweb/login", args)
 
     def test_cdp_forward_enabled_uses_internal_loopback_port(self):
         browser_service = self._load_browser_service(

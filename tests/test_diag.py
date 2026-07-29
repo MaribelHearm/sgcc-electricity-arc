@@ -3,6 +3,7 @@ import os
 import stat
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,24 @@ class DiagSwitchTestCase(unittest.TestCase):
             collector = DiagnosticCollector()
             collector.record_runtime(stage="test")
             self.assertEqual(collector.runtime["debug_mode"], "false")
+
+    def test_force_debug_overrides_disabled_user_switches(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SGCC_FORCE_DEBUG": "true",
+                "SGCC_DEBUG": "false",
+                "SGCC_DIAG": "false",
+                "DEBUG_MODE": "false",
+            },
+            clear=False,
+        ):
+            collector = DiagnosticCollector()
+            collector.record_runtime(stage="test")
+            self.assertTrue(debug_enabled())
+            self.assertEqual(collector.runtime["debug_mode"], "true")
+            self.assertEqual(collector.runtime["env"]["SGCC_FORCE_DEBUG"], "true")
+            self.assertEqual(diag_output_root(), Path("/data/debug"))
 
     def test_runtime_includes_daily_jitter_in_safe_environment(self):
         with patch.dict(
@@ -195,6 +214,24 @@ class DiagnosticCollectorTestCase(unittest.TestCase):
             collector = DiagnosticCollector(trigger_type="manual", output_dir=temp_dir)
             collector.set_run_id(42)
             collector.record_runtime(stage="test")
+            collector.record_browser_runtime(
+                "login_page_loaded",
+                {
+                    "page": {
+                        "userAgent": "Mozilla/5.0 Test",
+                        "webdriver": None,
+                        "languages": ["zh-CN", "zh"],
+                    },
+                    "webdriver": {
+                        "browser_version": "138.0.0.0",
+                        "chromedriver_version": "138.0.0.0",
+                    },
+                    "current_url": (
+                        "https://95598.cn/osgweb/login"
+                        "?token=secret-token&accountNo=1234567890016"
+                    ),
+                },
+            )
             collector.record_session(
                 "before_login",
                 SessionCheck(
@@ -215,6 +252,11 @@ class DiagnosticCollectorTestCase(unittest.TestCase):
             summary_text = (latest / "summary.txt").read_text(encoding="utf-8")
             summary_json_text = (latest / "summary.json").read_text(encoding="utf-8")
             fields_text = (latest / "fields.redacted.json").read_text(encoding="utf-8")
+            browser_runtime_text = (latest / "browser-runtime.json").read_text(
+                encoding="utf-8"
+            )
+            with zipfile.ZipFile(latest / "sgcc-debug-bundle.zip") as bundle:
+                bundle_names = set(bundle.namelist())
 
         self.assertIn(SUMMARY_START, summary_text)
         self.assertIn(SUMMARY_END, summary_text)
@@ -228,8 +270,16 @@ class DiagnosticCollectorTestCase(unittest.TestCase):
         payload = json.loads(summary_json_text)
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["run_id"], 42)
+        self.assertEqual(payload["debug"]["browser_runtime_count"], 1)
+        self.assertIn("browser-runtime.json", bundle_names)
+        self.assertIn("Mozilla/5.0 Test", browser_runtime_text)
 
-        combined = summary_text + summary_json_text + fields_text
+        combined = (
+            summary_text
+            + summary_json_text
+            + fields_text
+            + browser_runtime_text
+        )
         self.assertNotIn("1234567890016", combined)
         self.assertNotIn("13800138000", combined)
         self.assertNotIn("plain-password", combined)

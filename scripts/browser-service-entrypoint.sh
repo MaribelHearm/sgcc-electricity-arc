@@ -4,6 +4,15 @@ set -euo pipefail
 export DISPLAY="${DISPLAY:-:99}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/chrome-runtime}"
 PROFILE_DIR="${SGCC_BROWSER_PROFILE:-/data/chrome-profile}"
+BROWSER_WINDOW_SIZE="${BROWSER_WINDOW_SIZE:-1280,900}"
+if [[ "$BROWSER_WINDOW_SIZE" =~ ^([0-9]{3,5}),([0-9]{3,5})$ ]]; then
+  XVFB_WIDTH="${BASH_REMATCH[1]}"
+  XVFB_HEIGHT="${BASH_REMATCH[2]}"
+else
+  echo "invalid BROWSER_WINDOW_SIZE=${BROWSER_WINDOW_SIZE}; fallback to 1280,900" >&2
+  XVFB_WIDTH=1280
+  XVFB_HEIGHT=900
+fi
 mkdir -p /data/errors "$PROFILE_DIR" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 rm -f /tmp/.X99-lock
@@ -17,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-Xvfb "$DISPLAY" -screen 0 1440x960x24 -ac +extension RANDR -nolisten tcp -nolisten local -nolock >/tmp/xvfb.log 2>&1 &
+Xvfb "$DISPLAY" -screen 0 "${XVFB_WIDTH}x${XVFB_HEIGHT}x24" -ac +extension RANDR -nolisten tcp -nolisten local -nolock >/tmp/xvfb.log 2>&1 &
 PIDS+=("$!")
 sleep 1
 if ! kill -0 "${PIDS[0]}" >/dev/null 2>&1; then

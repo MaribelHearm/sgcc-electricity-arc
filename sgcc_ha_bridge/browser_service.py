@@ -26,12 +26,14 @@ CDP_FORWARD_ENABLED = os.getenv("SGCC_BROWSER_CDP_FORWARD_ENABLED", "false").str
 _CDP_INTERNAL_PORT_RAW = os.getenv("SGCC_BROWSER_CDP_INTERNAL_PORT", "").strip()
 CDP_INTERNAL_PORT = int(_CDP_INTERNAL_PORT_RAW) if _CDP_INTERNAL_PORT_RAW else (CDP_PORT + 1 if CDP_FORWARD_ENABLED else CDP_PORT)
 PROFILE_DIR = os.getenv("SGCC_BROWSER_PROFILE", "/data/chrome-profile")
-HOME_URL = os.getenv("SGCC_BROWSER_HOME_URL", "https://95598.cn/osgweb/login")
+START_URL = os.getenv("SGCC_BROWSER_START_URL", "about:blank")
 CHROME_BIN = os.getenv("SGCC_CHROME_BIN") or shutil.which("google-chrome") or shutil.which("google-chrome-stable") or "/usr/bin/google-chrome"
 DISPLAY = os.getenv("DISPLAY", ":99")
-LANG = os.getenv("BROWSER_LANGUAGE", "zh-CN")
+BROWSER_LANGUAGE = os.getenv("BROWSER_LANGUAGE", "zh-CN,zh,en-US,en")
+BROWSER_LANGUAGE_PRIMARY = BROWSER_LANGUAGE.split(",", 1)[0].strip() or "zh-CN"
 WINDOW_SIZE = os.getenv("BROWSER_WINDOW_SIZE", "1280,900")
 START_TIMEOUT = float(os.getenv("SGCC_BROWSER_START_TIMEOUT", "60"))
+REVISION = os.getenv("VERSION", "").strip() or "unknown"
 
 _state_lock = threading.RLock()
 _proc: subprocess.Popen | None = None
@@ -117,6 +119,28 @@ def _clear_profile_locks() -> None:
             pass
         except Exception as exc:
             print(f"warn: remove profile lock {name} failed: {exc}", flush=True)
+
+
+def _chrome_args() -> list[str]:
+    return [
+        CHROME_BIN,
+        f"--user-data-dir={PROFILE_DIR}",
+        f"--remote-debugging-address={_chrome_cdp_host()}",
+        f"--remote-debugging-port={_chrome_cdp_port()}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=Translate",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        f"--lang={BROWSER_LANGUAGE_PRIMARY}",
+        f"--accept-lang={BROWSER_LANGUAGE}",
+        f"--window-size={WINDOW_SIZE}",
+        START_URL,
+    ]
 
 
 def _rewrite_cdp_payload(body: bytes, public_host: str) -> bytes:
@@ -343,20 +367,7 @@ def _start_chrome() -> dict:
         env["DISPLAY"] = DISPLAY
         env.setdefault("LANG", "C.UTF-8")
         env.setdefault("LC_ALL", "C.UTF-8")
-        args = [
-            CHROME_BIN,
-            f"--user-data-dir={PROFILE_DIR}",
-            f"--remote-debugging-address={_chrome_cdp_host()}",
-            f"--remote-debugging-port={_chrome_cdp_port()}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-sandbox",
-            f"--lang={LANG}",
-            f"--window-size={WINDOW_SIZE}",
-            HOME_URL,
-        ]
+        args = _chrome_args()
         print("starting chrome: " + " ".join(args), flush=True)
         try:
             _proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -396,6 +407,7 @@ def _status_payload() -> dict:
     proc = _proc
     running = proc is not None and proc.poll() is None
     return {
+        "revision": REVISION,
         "running": running,
         "ready": _ready() if running else False,
         "pid": proc.pid if running else None,
@@ -403,6 +415,9 @@ def _status_payload() -> dict:
         "chrome_bin": CHROME_BIN,
         "profile_dir": PROFILE_DIR,
         "display": DISPLAY,
+        "start_url": START_URL,
+        "browser_language": BROWSER_LANGUAGE,
+        "window_size": WINDOW_SIZE,
         "cdp_url": f"http://{CDP_HOST}:{CDP_PORT}",
         "chrome_cdp_url": f"http://{_chrome_cdp_host()}:{_chrome_cdp_port()}",
         "cdp_forward_enabled": CDP_FORWARD_ENABLED,

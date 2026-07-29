@@ -81,8 +81,17 @@ run_main() {
 }
 
 start_xvfb() {
+  local browser_window_size="${BROWSER_WINDOW_SIZE:-1280,900}"
+  local xvfb_width=1280
+  local xvfb_height=900
+  if [[ "$browser_window_size" =~ ^([0-9]{3,5}),([0-9]{3,5})$ ]]; then
+    xvfb_width="${BASH_REMATCH[1]}"
+    xvfb_height="${BASH_REMATCH[2]}"
+  else
+    echo "invalid BROWSER_WINDOW_SIZE=${browser_window_size}; fallback to 1280,900" >&2
+  fi
   rm -f /tmp/.X99-lock
-  Xvfb "$DISPLAY" -screen 0 1440x960x24 -ac +extension RANDR -nolisten tcp -nolisten local -nolock >/tmp/xvfb.log 2>&1 &
+  Xvfb "$DISPLAY" -screen 0 "${xvfb_width}x${xvfb_height}x24" -ac +extension RANDR -nolisten tcp -nolisten local -nolock >/tmp/xvfb.log 2>&1 &
   local xvfb_pid="$!"
   PIDS+=("$xvfb_pid")
   sleep 1
