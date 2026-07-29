@@ -1,13 +1,10 @@
 ARG BASE_IMAGE=python:3.12.11-slim-bookworm
 FROM ${BASE_IMAGE}
 
-ARG VERSION=unknown
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
-    LANG=C.UTF-8 \
-    VERSION=${VERSION}
+    LANG=C.UTF-8
 
 RUN apt-get --allow-releaseinfo-change update \
     && apt-get install -y --no-install-recommends \
@@ -28,5 +25,8 @@ WORKDIR /app
 COPY sgcc_ha_bridge/ /app/sgcc_ha_bridge/
 COPY scripts/browser-service-entrypoint.sh /app/browser-service-entrypoint.sh
 RUN chmod +x /app/browser-service-entrypoint.sh
+
+ARG VERSION=unknown
+ENV VERSION=${VERSION}
 
 CMD ["/app/browser-service-entrypoint.sh"]
