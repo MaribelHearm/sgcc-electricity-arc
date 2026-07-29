@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- 腾讯验证码只处理当前 viewport 内实际显示的组件，避免把页面预加载在屏幕外的隐藏 scaffold 误判为正在进行的点选或滑块验证。
+- 点选验证码主图和参考图优先从渲染后的元素截图提取，兼容当前 95598 前端使用 `currentSrc`、CSS background 或运行时资源的方式。
+- 二维码登录会等待图片真正加载，并在失效时点击实际绑定刷新事件的遮罩；刷新后拒绝继续使用旧二维码。
+
+### Diagnostics
+
+- app/browser 镜像由同一次 CI 注入相同 Git revision；browser-service `/status` 暴露 revision，主程序启动 sidecar 时记录并检查两者是否一致。
+- 登录调试包增加不含凭证的浏览器运行态、请求元数据和关键阶段时间线。
+
+### Limitations
+
+- 上述修改修复项目侧验证码与二维码兜底链路，不代表国网服务端 `RK001` 风控已被绕过或根治；真实账号仍需低频、受控验证。
+
 ## [v0.1.8] - 2026-07-21
 
 ### Fixed
