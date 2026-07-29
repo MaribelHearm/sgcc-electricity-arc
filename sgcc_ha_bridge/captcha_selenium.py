@@ -5,12 +5,14 @@ Selenium 集成层 - 在浏览器中通过大模型解算验证码
 参考 ha-95598 项目的 DOM 操作方式。
 """
 
+import base64
 import io
 import logging
 import random
 import re
 import time
 from typing import List, Optional, Tuple
+from urllib.parse import urljoin
 
 import requests
 from PIL import Image
@@ -63,11 +65,17 @@ def has_captcha_in_browser(driver: WebDriver) -> bool:
             const visible = (el) => {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
+                const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+                const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
                 return rect.width > 40
                     && rect.height > 40
                     && style.display !== 'none'
                     && style.visibility !== 'hidden'
-                    && Number(style.opacity || 1) > 0;
+                    && Number(style.opacity || 1) > 0
+                    && rect.right > 0
+                    && rect.bottom > 0
+                    && rect.left < viewportWidth
+                    && rect.top < viewportHeight;
             };
             return selectors.some((selector) =>
                 Array.from(document.querySelectorAll(selector)).some(visible)
@@ -221,9 +229,17 @@ def solve_captcha_in_browser(driver: WebDriver,
 def _solve_slider(driver: WebDriver, selectors: dict) -> bool:
     """使用LLM解算滑块验证码：识别缺口位置 → 模拟拖拽。"""
     # 提取滑块背景图
-    bg_el = _find_element(driver, ".tencent-captcha-dy__slider-bg-img", wait=1.0)
+    bg_el = _find_visible_element(
+        driver,
+        ".tencent-captcha-dy__slider-bg-img",
+        wait=1.0,
+    )
     if bg_el is None:
-        bg_el = _find_element(driver, selectors.get("verify_bg_img"), wait=1.0)
+        bg_el = _find_visible_element(
+            driver,
+            selectors.get("verify_bg_img"),
+            wait=1.0,
+        )
     if bg_el is None:
         logger.warning("找不到滑块背景图片")
         return False
@@ -249,8 +265,16 @@ def _solve_slider(driver: WebDriver, selectors: dict) -> bool:
             return False
 
     # 获取滑块容器宽度用于距离计算
-    groove = _find_element(driver, selectors.get("slider_groove"), wait=1.0)
-    slider_block = _find_element(driver, selectors.get("slider_block"), wait=1.0)
+    groove = _find_visible_element(
+        driver,
+        selectors.get("slider_groove"),
+        wait=1.0,
+    )
+    slider_block = _find_visible_element(
+        driver,
+        selectors.get("slider_block"),
+        wait=1.0,
+    )
 
     if groove is None or slider_block is None:
         logger.warning("找不到滑块轨道/滑块块")
@@ -363,71 +387,135 @@ def _simulate_drag(driver: WebDriver, element: WebElement, distance: int):
 # ═══════════════════════════════════════════════════════════
 
 def _extract_ref_url(driver: WebDriver, selectors: dict) -> Optional[str]:
-    """提取参考图标条的图片 URL。"""
-    el = _find_element(driver, selectors.get("header_answer_img"))
+    """提取参考图标条；优先截取浏览器已经渲染的内容。"""
+    el = _find_visible_element(driver, selectors.get("header_answer_img"))
     if el is None:
         return None
-    src = el.get_attribute("src") or ""
-    if src:
-        return src
-    return None
+    source, _ = _extract_rendered_image(driver, el)
+    return source
 
 
 def _extract_main_url(driver: WebDriver, selectors: dict) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
-    """提取主图的 URL 及尺寸。"""
+    """提取主图及尺寸；兼容 CSS 背景图、data URI 和浏览器截图。"""
     # 多选择器查找
     for sel in [selectors.get("verify_bg_img"),
                 selectors.get("point_area"),
                 selectors.get("click_type_wrap"),
                 selectors.get("verify_bg")]:
-        el = _find_element(driver, sel)
+        el = _find_visible_element(driver, sel)
         if el is None:
             continue
-
-        tag = (el.tag_name or "").lower()
-        if tag == "img":
-            src = el.get_attribute("src") or ""
-            if src:
-                size = _get_image_size_from_url(src)
-                return src, size
-
-        style = el.get_attribute("style") or ""
-        url_match = re.search(r'url\(["\']?(https?://[^"\')\s]+)["\']?\)', style)
-        if url_match:
-            url = url_match.group(1)
-            size = _get_image_size_from_url(url)
-            return url, size
+        source, size = _extract_rendered_image(driver, el)
+        if source and size:
+            return source, size
 
     return None, None
 
 
 def _save_debug_images(ref_url: str, main_url: str):
     try:
-        if ref_url.startswith("http"):
-            resp = requests.get(ref_url, timeout=15)
-            if resp.status_code == 200:
-                with open("captcha_ref_strip_debug.png", "wb") as f:
-                    f.write(resp.content)
-        if main_url.startswith("http"):
-            resp = requests.get(main_url, timeout=15)
-            if resp.status_code == 200:
-                with open("captcha_main_debug.png", "wb") as f:
-                    f.write(resp.content)
+        ref_data = _load_image_bytes(ref_url)
+        if ref_data:
+            with open("captcha_ref_strip_debug.png", "wb") as f:
+                f.write(ref_data)
+        main_data = _load_image_bytes(main_url)
+        if main_data:
+            with open("captcha_main_debug.png", "wb") as f:
+                f.write(main_data)
     except Exception:
         pass
 
 
 def _get_image_size_from_url(url: str) -> Optional[Tuple[int, int]]:
-    if not url or not url.startswith("http"):
-        return None
     try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            img = Image.open(io.BytesIO(resp.content))
+        raw = _load_image_bytes(url)
+        if raw:
+            img = Image.open(io.BytesIO(raw))
             return img.size
     except Exception:
         pass
     return None
+
+
+def _load_image_bytes(source: str) -> Optional[bytes]:
+    if not source:
+        return None
+    if source.startswith("data:"):
+        try:
+            _, encoded = source.split(",", 1)
+            return base64.b64decode(encoded)
+        except Exception:
+            return None
+    if source.startswith("http"):
+        try:
+            resp = requests.get(source, timeout=15)
+            if resp.status_code == 200:
+                return resp.content
+        except Exception:
+            return None
+    return None
+
+
+def _extract_rendered_image(
+    driver: WebDriver,
+    element: WebElement,
+) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+    """Return a browser-rendered image as data URI, with URL fallback."""
+    try:
+        raw = element.screenshot_as_png
+        if raw:
+            size = Image.open(io.BytesIO(raw)).size
+            return (
+                "data:image/png;base64," + base64.b64encode(raw).decode("ascii"),
+                size,
+            )
+    except Exception as screenshot_error:
+        logger.debug(f"验证码元素截图失败，回退图片地址: {screenshot_error}")
+
+    candidates = []
+    try:
+        details = driver.execute_script("""
+            const el = arguments[0];
+            const style = window.getComputedStyle(el);
+            return {
+                currentSrc: el.currentSrc || '',
+                src: el.src || el.getAttribute('src') || '',
+                backgroundImage: style.backgroundImage || el.style.backgroundImage || ''
+            };
+        """, element) or {}
+        candidates.extend([
+            details.get("currentSrc", ""),
+            details.get("src", ""),
+            details.get("backgroundImage", ""),
+        ])
+    except Exception:
+        try:
+            candidates.extend([
+                element.get_attribute("src") or "",
+                element.get_attribute("style") or "",
+            ])
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        source = _extract_css_url(candidate) or candidate.strip()
+        if not source or source == "none" or source.startswith("blob:"):
+            continue
+        if not source.startswith(("data:", "http://", "https://")):
+            source = urljoin(driver.current_url, source)
+        size = _get_image_size_from_url(source)
+        if size:
+            return source, size
+    return None, None
+
+
+def _extract_css_url(value: str) -> Optional[str]:
+    if not value or "url(" not in value:
+        return None
+    match = re.search(r"""url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]*))\s*\)""", value)
+    if not match:
+        return None
+    return next((part.strip() for part in match.groups() if part), None)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -446,10 +534,22 @@ def _detect_captcha_type_js(driver: WebDriver) -> str:
     """
     try:
         result = driver.execute_script("""
+            function visible(el) {
+                var rect = el.getBoundingClientRect();
+                var style = window.getComputedStyle(el);
+                var viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+                var viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+                return rect.width > 5 && rect.height > 5 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       Number(style.opacity || 1) > 0 &&
+                       rect.right > 0 && rect.bottom > 0 &&
+                       rect.left < viewportWidth && rect.top < viewportHeight;
+            }
             function textOf(sel) {
                 var els = document.querySelectorAll(sel);
                 for (var i = 0; i < els.length; i++) {
-                    if (els[i].offsetParent !== null) {
+                    if (visible(els[i])) {
                         return (els[i].textContent || els[i].innerText || '').trim();
                     }
                 }
@@ -458,7 +558,7 @@ def _detect_captcha_type_js(driver: WebDriver) -> str:
             function exists(sel) {
                 var els = document.querySelectorAll(sel);
                 for (var i = 0; i < els.length; i++) {
-                    if (els[i].offsetParent !== null) return true;
+                    if (visible(els[i])) return true;
                 }
                 return false;
             }
@@ -495,7 +595,7 @@ def _detect_captcha_type_js(driver: WebDriver) -> str:
 
 def _detect_captcha_type_fallback(driver: WebDriver) -> str:
     """回退检测方法（HTML文本扫描）。"""
-    content_el = _find_element(driver, "#tCaptchaDyContent", wait=1.0)
+    content_el = _find_visible_element(driver, "#tCaptchaDyContent", wait=1.0)
     if content_el is None:
         return "unknown"
     try:
@@ -512,25 +612,68 @@ def _detect_captcha_type_fallback(driver: WebDriver) -> str:
 
 
 def _wait_for_captcha(driver: WebDriver, selectors: dict, timeout: int) -> bool:
-    # 等待任一已知验证码容器出现
-    for sel in _WIDGET_SELECTORS:
-        try:
-            WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-            )
-            return True
-        except Exception:
-            continue
-    return False
+    try:
+        WebDriverWait(driver, timeout).until(has_captcha_in_browser)
+        return True
+    except Exception:
+        return False
 
 
 def _find_element(driver: WebDriver, selector: str, wait: float = 1.0) -> Optional[WebElement]:
+    if not selector:
+        return None
     try:
         return WebDriverWait(driver, wait).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, selector))
         )
     except Exception:
         return None
+
+
+def _find_visible_element(
+    driver: WebDriver,
+    selector: str,
+    wait: float = 1.0,
+) -> Optional[WebElement]:
+    if not selector:
+        return None
+
+    def locate(d):
+        for element in d.find_elements(By.CSS_SELECTOR, selector):
+            if _is_element_in_viewport(d, element):
+                return element
+        return False
+
+    try:
+        return WebDriverWait(driver, wait).until(locate)
+    except Exception:
+        return None
+
+
+def _is_element_in_viewport(
+    driver: WebDriver,
+    element: WebElement,
+    min_width: int = 5,
+    min_height: int = 5,
+) -> bool:
+    try:
+        return bool(driver.execute_script("""
+            const el = arguments[0];
+            const minWidth = arguments[1];
+            const minHeight = arguments[2];
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+            return rect.width >= minWidth && rect.height >= minHeight &&
+                   style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   Number(style.opacity || 1) > 0 &&
+                   rect.right > 0 && rect.bottom > 0 &&
+                   rect.left < viewportWidth && rect.top < viewportHeight;
+        """, element, min_width, min_height))
+    except Exception:
+        return False
 
 
 def _find_main_image_element(driver: WebDriver, selectors: dict,
@@ -554,6 +697,7 @@ def _find_main_image_element(driver: WebDriver, selectors: dict,
                         "var r = arguments[0].getBoundingClientRect();"
                         "if (r.width < 80 || r.height < 80) return null;"
                         "if (r.bottom <= 0 || r.right <= 0) return null;"
+                        "if (r.top >= window.innerHeight || r.left >= window.innerWidth) return null;"
                         "return {h: r.height, w: r.width};",
                         el
                     )
@@ -613,11 +757,9 @@ def _check_passed(driver: WebDriver, selectors: dict) -> bool:
             return True
     except Exception:
         pass
-    el = _find_element(driver, selectors["content"], wait=0.5)
-    if el is None or not el.is_displayed():
+    if not has_captcha_in_browser(driver):
         time.sleep(2)
-        el2 = _find_element(driver, selectors["content"], wait=0.5)
-        if el2 is None or not el2.is_displayed():
+        if not has_captcha_in_browser(driver):
             return True
     return False
 
@@ -651,9 +793,18 @@ def _refresh_captcha(driver: WebDriver, selectors: dict):
     # 策略 3: JS 查找刷新相关元素（elementFromPoint 回退）
     try:
         driver.execute_script("""
+            function visible(el) {
+                var r = el.getBoundingClientRect();
+                var style = window.getComputedStyle(el);
+                return r.width > 5 && r.height > 5 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       r.right > 0 && r.bottom > 0 &&
+                       r.left < window.innerWidth && r.top < window.innerHeight;
+            }
             var els = document.querySelectorAll('[class*="refresh"], [class*="footer-icon"]');
             for (var i = 0; i < els.length; i++) {
-                if (els[i].offsetParent !== null && els[i].getBoundingClientRect().width > 5) {
+                if (visible(els[i])) {
                     els[i].click();
                     return;
                 }

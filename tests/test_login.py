@@ -258,6 +258,7 @@ class LoginFallbackTestCase(unittest.TestCase):
         driver = Mock()
         driver.current_url = "https://95598.cn/osgweb/callback-error"
         qr_element = Mock()
+        qr_element.get_dom_attribute.return_value = "data:image/png;base64,cG5n"
         qr_element.get_attribute.return_value = "data:image/png;base64,cG5n"
         wait.return_value.until.side_effect = [Mock(), qr_element, TimeoutException()]
 
@@ -284,6 +285,81 @@ class LoginFallbackTestCase(unittest.TestCase):
             False,
             "扫码后仍未确认登录态",
         )
+
+    @patch("sgcc_ha_bridge.login.WebDriverWait")
+    def test_expired_qrcode_is_refreshed_before_returning_image(self, wait):
+        driver = Mock()
+        expired = Mock()
+        expired.text = "二维码失效，点击图片重新获取"
+        expired.is_displayed.return_value = True
+        fresh_container = Mock()
+        fresh_container.text = ""
+        fresh_container.is_displayed.return_value = True
+        stale_element = Mock()
+        stale_element.is_displayed.return_value = True
+        stale_element.get_dom_attribute.return_value = "data:image/png;base64,b2xk"
+        refresh_overlay = Mock()
+        refresh_overlay.is_displayed.return_value = True
+        qr_element = Mock()
+        qr_element.is_displayed.return_value = True
+        qr_element.get_dom_attribute.return_value = "data:image/png;base64,cG5n"
+        driver.execute_script.return_value = True
+        container_calls = 0
+        image_calls = 0
+
+        def find_elements(by, selector):
+            nonlocal container_calls
+            nonlocal image_calls
+            if selector == ".sweepCodePic":
+                container_calls += 1
+                return [expired] if container_calls == 1 else [fresh_container]
+            if selector == ".sweepCodePic img":
+                image_calls += 1
+                return [stale_element] if image_calls <= 2 else [qr_element]
+            if selector == ".sweepCodePic .erwBg":
+                return [refresh_overlay]
+            return []
+
+        driver.find_elements.side_effect = find_elements
+        login = SgccLogin.__new__(SgccLogin)
+        login.config = SimpleNamespace(DRIVER_IMPLICITY_WAIT_TIME=1)
+        login._click_element = Mock()
+
+        def until(predicate):
+            self.assertFalse(predicate(driver))
+            self.assertFalse(predicate(driver))
+            return predicate(driver)
+
+        wait.return_value.until.side_effect = until
+
+        self.assertIs(login._wait_for_fresh_qr_image(driver), qr_element)
+        login._click_element.assert_called_once_with(driver, refresh_overlay)
+        stale_element.is_displayed.assert_called_once()
+
+    @patch("sgcc_ha_bridge.login.WebDriverWait")
+    def test_qrcode_waits_until_async_image_source_is_loaded(self, wait):
+        driver = Mock()
+        blank = Mock()
+        blank.is_displayed.return_value = True
+        blank.get_dom_attribute.return_value = ""
+        loaded = Mock()
+        loaded.is_displayed.return_value = True
+        loaded.get_dom_attribute.return_value = "data:image/png;base64,cG5n"
+        driver.execute_script.return_value = True
+        driver.find_elements.side_effect = [[], [blank], [], [loaded]]
+
+        login = SgccLogin.__new__(SgccLogin)
+        login.config = SimpleNamespace(DRIVER_IMPLICITY_WAIT_TIME=1)
+        login._click_element = Mock()
+
+        def until(predicate):
+            self.assertFalse(predicate(driver))
+            return predicate(driver)
+
+        wait.return_value.until.side_effect = until
+
+        self.assertIs(login._wait_for_fresh_qr_image(driver), loaded)
+        login._click_element.assert_not_called()
 
     def test_risk_blocked_skips_interactive_fallback(self):
         login = SgccLogin.__new__(SgccLogin)

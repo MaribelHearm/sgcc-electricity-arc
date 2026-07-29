@@ -657,14 +657,17 @@ class SgccLogin:
         logging.info("已切换到二维码模式")
 
         time.sleep(self.config.RETRY_WAIT_TIME_OFFSET_UNIT)
-        # 获取登录二维码
-        qrElement = WebDriverWait(driver, self.config.DRIVER_IMPLICITY_WAIT_TIME).until(
-            EC.visibility_of_element_located((By.XPATH, "//div[@class='sweepCodePic']//img")))
+        qrElement = self._wait_for_fresh_qr_image(driver)
         logging.info("已找到二维码图片元素")
 
-        img_src = qrElement.get_attribute('src')
+        try:
+            img_src = qrElement.get_dom_attribute("src") or ""
+        except Exception:
+            img_src = qrElement.get_attribute("src") or ""
+        if not isinstance(img_src, str):
+            img_src = qrElement.get_attribute("src") or ""
 
-        if img_src.startswith('data:image'):
+        if img_src and img_src.startswith('data:image'):
             base64_data = img_src.split(',')[1]
             img_screenshot = base64.b64decode(base64_data)
         else:
@@ -720,6 +723,77 @@ class SgccLogin:
                 pass
             except OSError as cleanup_error:
                 logging.warning(f"删除登录二维码临时文件失败: {cleanup_error}")
+
+    def _wait_for_fresh_qr_image(self, driver):
+        """Wait for a QR image and refresh the expired placeholder once."""
+        refresh_clicked = False
+        stale_sources = set()
+
+        def image_source(image):
+            try:
+                src = image.get_dom_attribute("src") or ""
+            except Exception:
+                src = image.get_attribute("src") or ""
+            if not isinstance(src, str):
+                src = image.get_attribute("src") or ""
+            return src
+
+        def locate_or_refresh(d):
+            nonlocal refresh_clicked
+            expired_visible = False
+            for container in d.find_elements(By.CSS_SELECTOR, ".sweepCodePic"):
+                try:
+                    text = (container.text or "").strip()
+                    expired_visible = container.is_displayed() and any(
+                        marker in text for marker in ("二维码失效", "重新获取")
+                    )
+                    if expired_visible and not refresh_clicked:
+                        for image in d.find_elements(
+                            By.CSS_SELECTOR,
+                            ".sweepCodePic img",
+                        ):
+                            source = image_source(image)
+                            if source:
+                                stale_sources.add(source)
+                        logging.info("二维码已失效，点击页面重新获取")
+                        refresh_target = container
+                        for overlay in d.find_elements(
+                            By.CSS_SELECTOR,
+                            ".sweepCodePic .erwBg",
+                        ):
+                            if overlay.is_displayed():
+                                refresh_target = overlay
+                                break
+                        self._click_element(d, refresh_target)
+                        refresh_clicked = True
+                except Exception as refresh_error:
+                    logging.warning(f"刷新失效二维码失败: {refresh_error}")
+            if expired_visible:
+                return False
+
+            for image in d.find_elements(By.CSS_SELECTOR, ".sweepCodePic img"):
+                try:
+                    src = image_source(image)
+                    loaded = d.execute_script(
+                        "return Boolean(arguments[0].complete) && "
+                        "Number(arguments[0].naturalWidth || 0) > 0;",
+                        image,
+                    )
+                    if (
+                        image.is_displayed()
+                        and src
+                        and src not in stale_sources
+                        and loaded
+                    ):
+                        return image
+                except Exception:
+                    continue
+            return False
+
+        return WebDriverWait(
+            driver,
+            self.config.DRIVER_IMPLICITY_WAIT_TIME,
+        ).until(locate_or_refresh)
 
     def _random_delay(self, min_seconds=0.5, max_seconds=3.0):
         """添加随机延迟，使自动化操作更难被检测。"""
