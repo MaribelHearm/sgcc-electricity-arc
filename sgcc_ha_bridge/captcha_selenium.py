@@ -11,6 +11,7 @@ import logging
 import random
 import re
 import time
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 from urllib.parse import urljoin
 
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 TENCENT_SELECTORS = {
     "content": "#tCaptchaDyContent",
+    "header_text": ".tencent-captcha-dy__header-text",
+    "header_answer": ".tencent-captcha-dy__header-answer",
     "header_answer_img": ".tencent-captcha-dy__header-answer img",
     "point_area": ".tencent-captcha-dy__point-area",
     "click_type_wrap": ".tencent-captcha-dy__click-type-wrap",
@@ -133,22 +136,30 @@ def solve_captcha_in_browser(driver: WebDriver,
             if captcha_type != "click":
                 continue
 
-        # 提取图片 URL
-        ref_url = _extract_ref_url(driver, selectors)
+        # 提取图形/文字参考内容和主图
+        ref_url, ref_text = _extract_reference(driver, selectors)
         main_url, main_size = _extract_main_url(driver, selectors)
 
-        if not ref_url or not main_url:
-            logger.warning("提取验证码图片URL失败，正在刷新...")
+        if not (ref_url or ref_text) or not main_url:
+            logger.warning("提取验证码参考内容或主图失败，正在刷新...")
             _refresh_captcha(driver, selectors)
             time.sleep(1)
             continue
 
+        if ref_text:
+            logger.info(f"验证码参考类型=文字点选，目标数={len(ref_text.split())}")
         logger.info(f"主图尺寸={main_size}")
 
         _save_debug_images(ref_url, main_url)
 
         # 调用大模型解算
-        coords = solver.solve(ref_url, main_url, main_size[0], main_size[1])
+        coords = solver.solve(
+            ref_url,
+            main_url,
+            main_size[0],
+            main_size[1],
+            reference_text=ref_text,
+        )
         if not coords or len(coords) < 2:
             logger.warning(f"从大模型仅获取到 {len(coords)} 个坐标，正在刷新...")
             _refresh_captcha(driver, selectors)
@@ -386,13 +397,58 @@ def _simulate_drag(driver: WebDriver, element: WebElement, distance: int):
 # 图片 URL 提取
 # ═══════════════════════════════════════════════════════════
 
-def _extract_ref_url(driver: WebDriver, selectors: dict) -> Optional[str]:
-    """提取参考图标条；优先截取浏览器已经渲染的内容。"""
+def _extract_reference(
+    driver: WebDriver,
+    selectors: dict,
+) -> Tuple[Optional[str], Optional[str]]:
+    """提取图形或文字点选题的参考内容。"""
     el = _find_visible_element(driver, selectors.get("header_answer_img"))
-    if el is None:
-        return None
-    source, _ = _extract_rendered_image(driver, el)
+    if el is not None:
+        source, _ = _extract_rendered_image(driver, el)
+        if source:
+            return source, None
+
+    text_el = _find_visible_element(driver, selectors.get("header_text"))
+    if text_el is not None:
+        try:
+            reference_text = _extract_click_reference_text(text_el.text or "")
+            if reference_text:
+                return None, reference_text
+        except Exception:
+            pass
+
+    answer_el = _find_visible_element(driver, selectors.get("header_answer"))
+    if answer_el is not None:
+        source, _ = _extract_rendered_image(driver, answer_el)
+        if source:
+            return source, None
+
+    return None, None
+
+
+def _extract_ref_url(driver: WebDriver, selectors: dict) -> Optional[str]:
+    """兼容旧调用：仅返回图形点选题的参考图。"""
+    source, _ = _extract_reference(driver, selectors)
     return source
+
+
+def _extract_click_reference_text(prompt: str) -> Optional[str]:
+    """从“请依次点击：爱 诧 畅”中提取有序目标。"""
+    text = (prompt or "").strip()
+    if not text:
+        return None
+
+    if "：" in text:
+        text = text.split("：", 1)[1]
+    elif ":" in text:
+        text = text.split(":", 1)[1]
+    else:
+        text = re.sub(r"^\s*请?\s*(?:依次|顺序)?\s*点击\s*", "", text)
+
+    tokens = re.findall(r"[\u3400-\u9fff]|[A-Za-z0-9]+", text)
+    if len(tokens) < 2:
+        return None
+    return " ".join(tokens[:3])
 
 
 def _extract_main_url(driver: WebDriver, selectors: dict) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
@@ -412,7 +468,7 @@ def _extract_main_url(driver: WebDriver, selectors: dict) -> Tuple[Optional[str]
     return None, None
 
 
-def _save_debug_images(ref_url: str, main_url: str):
+def _save_debug_images(ref_url: Optional[str], main_url: str):
     try:
         ref_data = _load_image_bytes(ref_url)
         if ref_data:
@@ -437,7 +493,7 @@ def _get_image_size_from_url(url: str) -> Optional[Tuple[int, int]]:
     return None
 
 
-def _load_image_bytes(source: str) -> Optional[bytes]:
+def _load_image_bytes(source: Optional[str]) -> Optional[bytes]:
     if not source:
         return None
     if source.startswith("data:"):
@@ -622,12 +678,13 @@ def _wait_for_captcha(driver: WebDriver, selectors: dict, timeout: int) -> bool:
 def _find_element(driver: WebDriver, selector: str, wait: float = 1.0) -> Optional[WebElement]:
     if not selector:
         return None
-    try:
-        return WebDriverWait(driver, wait).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-        )
-    except Exception:
-        return None
+    with _without_implicit_wait(driver):
+        try:
+            return WebDriverWait(driver, wait).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+        except Exception:
+            return None
 
 
 def _find_visible_element(
@@ -644,10 +701,32 @@ def _find_visible_element(
                 return element
         return False
 
+    with _without_implicit_wait(driver):
+        try:
+            return WebDriverWait(driver, wait).until(locate)
+        except Exception:
+            return None
+
+
+def _current_implicit_wait(driver: WebDriver) -> float:
     try:
-        return WebDriverWait(driver, wait).until(locate)
+        value = driver.timeouts.implicit_wait
+        if isinstance(value, (int, float)):
+            return float(value)
     except Exception:
-        return None
+        pass
+    return 60.0
+
+
+@contextmanager
+def _without_implicit_wait(driver: WebDriver):
+    """避免显式等待与全局 60 秒隐式等待叠加。"""
+    original = _current_implicit_wait(driver)
+    try:
+        driver.implicitly_wait(0)
+        yield
+    finally:
+        driver.implicitly_wait(original)
 
 
 def _is_element_in_viewport(
@@ -681,8 +760,7 @@ def _find_main_image_element(driver: WebDriver, selectors: dict,
     """找到用于坐标转换的可见图片元素。优先宽高比与主图匹配的元素。"""
     best = None
     best_aspect_diff = float('inf')
-    driver.implicitly_wait(0)
-    try:
+    with _without_implicit_wait(driver):
         for sel in [
             selectors.get("verify_bg_img"),
             selectors.get("image_area"),
@@ -714,8 +792,6 @@ def _find_main_image_element(driver: WebDriver, selectors: dict,
                     pass
             if best and not expected_aspect:
                 break
-    finally:
-        driver.implicitly_wait(60)
     return best
 
 
