@@ -160,6 +160,10 @@ class LoginFallbackTestCase(unittest.TestCase):
         login._username = "13800000000"
         login.config = SimpleNamespace(RETRY_WAIT_TIME_OFFSET_UNIT=0)
         login._click_button = Mock()
+        login._request_phone_code = Mock(return_value={
+            "status": "sent",
+            "auth_time": 60,
+        })
         login._type_text = Mock()
         login._wait_for_login_submit_state = Mock(
             return_value=("error", "验证码错误")
@@ -197,6 +201,10 @@ class LoginFallbackTestCase(unittest.TestCase):
             RETRY_TIMES_LIMIT=3,
         )
         login._click_button = Mock()
+        login._request_phone_code = Mock(return_value={
+            "status": "sent",
+            "auth_time": 60,
+        })
         login._type_text = Mock()
         login._wait_for_login_submit_state = Mock(
             side_effect=[("captcha", None), ("authenticated", None)]
@@ -234,6 +242,10 @@ class LoginFallbackTestCase(unittest.TestCase):
             DRIVER_IMPLICITY_WAIT_TIME=0,
         )
         login._click_button = Mock()
+        login._request_phone_code = Mock(return_value={
+            "status": "sent",
+            "auth_time": 60,
+        })
         login._type_text = Mock()
         login._wait_for_login_submit_state = Mock(return_value=("captcha", None))
         login._get_error_message = Mock(return_value=None)
@@ -251,6 +263,82 @@ class LoginFallbackTestCase(unittest.TestCase):
             False,
             "短信验证码提交后的腾讯人机验证未通过",
         )
+
+    def test_phone_code_request_falls_back_until_frontend_confirms_sent(self):
+        login = SgccLogin.__new__(SgccLogin)
+        login.diagnostic = None
+        login.config = SimpleNamespace(RETRY_TIMES_LIMIT=1)
+        element = Mock()
+        element.is_displayed.return_value = True
+        element.is_enabled.return_value = True
+        driver = Mock()
+        driver.find_elements.return_value = [element]
+        login._wait_for_phone_code_request_state = Mock(side_effect=[
+            {"status": "pending", "auth_time": 0, "error": ""},
+            {"status": "sent", "auth_time": 58, "error": ""},
+        ])
+        action_chain = Mock()
+        action_chain.move_to_element.return_value = action_chain
+        action_chain.pause.return_value = action_chain
+        action_chain.click.return_value = action_chain
+
+        with patch("sgcc_ha_bridge.login.ActionChains", return_value=action_chain):
+            state = login._request_phone_code(driver)
+
+        self.assertEqual(state["status"], "sent")
+        action_chain.perform.assert_called_once()
+        element.click.assert_called_once()
+        driver.execute_script.assert_not_called()
+
+    @patch("sgcc_ha_bridge.login.solve_captcha_in_browser", return_value=True)
+    def test_phone_code_request_solves_visible_pre_send_captcha(self, solve_captcha):
+        login = SgccLogin.__new__(SgccLogin)
+        login.diagnostic = Mock()
+        login.config = SimpleNamespace(RETRY_TIMES_LIMIT=2)
+        element = Mock()
+        element.is_displayed.return_value = True
+        element.is_enabled.return_value = True
+        driver = Mock()
+        driver.find_elements.return_value = [element]
+        login._wait_for_phone_code_request_state = Mock(side_effect=[
+            {"status": "captcha", "auth_time": 0, "error": ""},
+            {"status": "sent", "auth_time": 60, "error": ""},
+        ])
+        action_chain = Mock()
+        action_chain.move_to_element.return_value = action_chain
+        action_chain.pause.return_value = action_chain
+        action_chain.click.return_value = action_chain
+
+        with patch("sgcc_ha_bridge.login.ActionChains", return_value=action_chain):
+            state = login._request_phone_code(driver)
+
+        self.assertEqual(state["status"], "sent")
+        solve_captcha.assert_called_once_with(driver, max_retries=2)
+        login.diagnostic.record_timeline.assert_any_call(
+            "login_phone_code_request_captcha_finished",
+            passed=True,
+        )
+
+    def test_phone_code_request_failure_does_not_start_telegram_wait(self):
+        driver = Mock()
+        driver.find_elements.return_value = [Mock(), Mock(), Mock(), Mock()]
+        login = SgccLogin.__new__(SgccLogin)
+        login.driver = driver
+        login._username = "13800000000"
+        login.config = SimpleNamespace(RETRY_WAIT_TIME_OFFSET_UNIT=0)
+        login._click_button = Mock()
+        login._request_phone_code = Mock(side_effect=LoginFailure(
+            "phone_code_request_failed",
+            "未确认短信已发送",
+        ))
+        login._type_text = Mock()
+
+        with patch("sgcc_ha_bridge.login.build_login_interaction") as interaction:
+            with self.assertRaises(LoginFailure) as raised:
+                login._phone_code_login(driver, "test")
+
+        self.assertEqual(raised.exception.category, "phone_code_request_failed")
+        interaction.assert_not_called()
 
     @patch("sgcc_ha_bridge.login.build_login_interaction")
     @patch("sgcc_ha_bridge.login.WebDriverWait")

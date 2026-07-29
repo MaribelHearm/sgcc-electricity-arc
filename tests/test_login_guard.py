@@ -30,6 +30,9 @@ class LoginGuardTestCase(unittest.TestCase):
     def test_phone_code_timeout_is_non_retryable(self):
         self.assertFalse(should_retry_login_failure("phone_code_timeout"))
 
+    def test_phone_code_request_failure_is_non_retryable(self):
+        self.assertFalse(should_retry_login_failure("phone_code_request_failed"))
+
     def test_login_ui_failure_is_non_retryable(self):
         self.assertFalse(should_retry_login_failure("login_ui_failed"))
 

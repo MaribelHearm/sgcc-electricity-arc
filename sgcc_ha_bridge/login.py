@@ -26,6 +26,7 @@ PASSWORD_TAB_SELECTOR = "#login_box .selectlogin-type .password_login"
 PASSWORD_TERMS_SELECTOR = (
     "#login_box .account-login .password_form .checked-box.un-checked"
 )
+PHONE_CODE_REQUEST_SELECTOR = "#login_box a.yanzheng"
 
 
 class SgccLogin:
@@ -575,8 +576,12 @@ class SgccLogin:
         input_elements[2].clear()
         self._type_text(input_elements[2], self._username)
         logging.info(f"已输入用户名: {mask_secret(self._username)}\r")
-        self._click_button(driver, By.XPATH, '//*[@id="login_box"]/div[2]/div[2]/form/div[1]/div[2]/div[2]/div/a')
-        self._record_debug_event("phone_code_requested")
+        request_state = self._request_phone_code(driver)
+        self._record_debug_event(
+            "phone_code_requested",
+            request_status=request_state.get("status", ""),
+            auth_time=request_state.get("auth_time", 0),
+        )
 
         interaction = build_login_interaction()
         code = read_sms_code(interaction, reason)
@@ -647,6 +652,189 @@ class SgccLogin:
             or "短信验证码及人机验证提交后仍未登录"
         )
         raise LoginFailure(classify_login_failure(error), error)
+
+    def _request_phone_code(self, driver) -> dict:
+        """Click the visible send-code control and require a decisive frontend state."""
+        attempts = (
+            (
+                "native",
+                lambda element: ActionChains(driver).move_to_element(element).pause(
+                    random.uniform(0.08, 0.25)
+                ).click().perform(),
+            ),
+            ("webdriver", lambda element: element.click()),
+            (
+                "javascript",
+                lambda element: driver.execute_script(
+                    "arguments[0].click();",
+                    element,
+                ),
+            ),
+        )
+
+        for method, action in attempts:
+            element = self._visible_phone_code_request_element(driver)
+            if element is None:
+                raise LoginFailure(
+                    "phone_code_request_failed",
+                    "未找到可见的获取验证码按钮",
+                )
+            try:
+                action(element)
+            except Exception as error:
+                logging.warning(
+                    "获取短信验证码点击失败，方式=%s, error=%s: %s",
+                    method,
+                    type(error).__name__,
+                    redact_text(error)[:500],
+                )
+                continue
+
+            state = self._wait_for_phone_code_request_state(driver, timeout=3.0)
+            if state["status"] == "sent":
+                logging.info("国网前端已确认短信验证码发送。")
+                return state
+            if state["status"] == "error":
+                raise LoginFailure(
+                    "phone_code_request_failed",
+                    state.get("error") or "国网前端返回短信验证码发送失败",
+                )
+            if state["status"] == "captcha":
+                logging.info("发送短信验证码前出现腾讯人机验证，开始处理。")
+                self._record_debug_event("phone_code_request_captcha_started")
+                passed = solve_captcha_in_browser(
+                    driver,
+                    max_retries=self.config.RETRY_TIMES_LIMIT,
+                )
+                self._record_debug_event(
+                    "phone_code_request_captcha_finished",
+                    capture_browser=True,
+                    passed=passed,
+                )
+                if not passed:
+                    raise LoginFailure(
+                        "captcha_failed",
+                        "发送短信验证码前的腾讯人机验证未通过",
+                    )
+                state = self._wait_for_phone_code_request_state(
+                    driver,
+                    timeout=10.0,
+                )
+                if state["status"] == "sent":
+                    logging.info("人机验证通过，国网前端已确认短信验证码发送。")
+                    return state
+                if state["status"] == "error":
+                    raise LoginFailure(
+                        "phone_code_request_failed",
+                        state.get("error") or "人机验证通过后短信验证码发送失败",
+                    )
+
+            logging.warning(
+                "获取验证码点击后前端未确认发送，准备回退下一点击方式: %s",
+                method,
+            )
+
+        raise LoginFailure(
+            "phone_code_request_failed",
+            "点击获取验证码后前端未确认短信已发送",
+        )
+
+    @staticmethod
+    def _visible_phone_code_request_element(driver):
+        elements = driver.find_elements(By.CSS_SELECTOR, PHONE_CODE_REQUEST_SELECTOR)
+        for element in elements:
+            try:
+                if element.is_displayed() and element.is_enabled():
+                    return element
+            except Exception:
+                continue
+        return None
+
+    def _wait_for_phone_code_request_state(
+        self,
+        driver,
+        *,
+        timeout: float,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        latest = {"status": "pending", "auth_time": 0, "error": ""}
+        while time.monotonic() < deadline:
+            latest = self._phone_code_request_state(driver)
+            if latest["status"] in {"sent", "error"}:
+                return latest
+            if has_captcha_in_browser(driver):
+                return {**latest, "status": "captcha"}
+            time.sleep(0.2)
+        return latest
+
+    @staticmethod
+    def _phone_code_request_state(driver) -> dict:
+        try:
+            state = driver.execute_script("""
+                const seen = new Set();
+                let authTime = 0;
+                let sendAuthCode = null;
+                let codeMsg = '';
+                let validError = '';
+                let sendError = '';
+                let success = false;
+                let errorVisible = false;
+
+                for (const element of document.querySelectorAll('*')) {
+                    let vm = element.__vue__;
+                    while (vm) {
+                        if (!seen.has(vm)) {
+                            seen.add(vm);
+                            const data = vm.$data || {};
+                            if (Number(data.auth_time || 0) > authTime) {
+                                authTime = Number(data.auth_time || 0);
+                            }
+                            if (typeof data.sendAuthCode === 'boolean') {
+                                sendAuthCode = data.sendAuthCode;
+                            }
+                            if (typeof data.codeMsg === 'string' && data.codeMsg) {
+                                codeMsg = data.codeMsg;
+                            }
+                            const message = data.passLoginErrMsg;
+                            if (message && typeof message === 'object') {
+                                validError = String(message.validErr || validError || '');
+                                sendError = String(message.sendErr || sendError || '');
+                                success = Boolean(message.isSucess || success);
+                                errorVisible = Boolean(
+                                    message.isShow || message.isShowCode || errorVisible
+                                );
+                            }
+                        }
+                        vm = vm.$parent;
+                    }
+                }
+
+                const sent = authTime > 0
+                    || sendAuthCode === false
+                    || success
+                    || /验证码已发送|Verification Code has been sent/i.test(validError);
+                const failed = !sent && errorVisible && Boolean(sendError || validError);
+                return {
+                    status: sent ? 'sent' : failed ? 'error' : 'pending',
+                    auth_time: authTime,
+                    code_msg: codeMsg,
+                    error: failed ? (sendError || validError) : '',
+                };
+            """)
+            if isinstance(state, dict):
+                return {
+                    "status": state.get("status", "pending"),
+                    "auth_time": int(state.get("auth_time") or 0),
+                    "code_msg": str(state.get("code_msg") or ""),
+                    "error": str(state.get("error") or ""),
+                }
+        except Exception as error:
+            logging.warning(
+                "读取短信验证码发送状态失败[%s]: %s",
+                type(error).__name__,
+                redact_text(error)[:500],
+            )
+        return {"status": "pending", "auth_time": 0, "code_msg": "", "error": ""}
 
     def _qr_login(self, driver, reason: str) -> bool:
         logging.info("二维码登录开始")
