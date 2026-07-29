@@ -79,6 +79,17 @@ SGCC_BROWSER_IMAGE=ghcr.io/maribelhearm/sgcc-home-assistant-bridge-browser:v0.1.
 
 Compose 使用 `browser-service` 时，app/browser 两个镜像建议固定到同一个 tag，避免 app 内 ChromeDriver 与 browser-service Chrome 版本不一致。
 
+browser-service 的 `/status` 会返回镜像 `revision`。主程序每次启动 sidecar 时也会记录
+`app_revision` 和 `browser_revision`；两者都已标记且不一致时会输出警告。排查部署版本时可先执行：
+
+```bash
+curl -s http://127.0.0.1:39222/status
+docker inspect sgcc_electricity_arc --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^VERSION='
+```
+
+正式发布的 app/browser 镜像由同一次 CI 构建注入相同的 Git commit SHA。若使用自建镜像，
+应给两个 Dockerfile 传入相同的 `VERSION` build arg。
+
 也可以继续本地构建：
 
 ```bash

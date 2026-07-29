@@ -381,6 +381,29 @@ def _browser_service_start() -> None:
         try:
             response = requests.post(f"{url}/start", timeout=10)
             if response.status_code < 400:
+                try:
+                    status = response.json()
+                except ValueError:
+                    status = {}
+                app_revision = os.getenv("VERSION", "").strip() or "unknown"
+                browser_revision = str(status.get("revision") or "unknown")
+                logging.info(
+                    "browser-service 已就绪: app_revision=%s, browser_revision=%s, ready=%s",
+                    app_revision,
+                    browser_revision,
+                    status.get("ready"),
+                )
+                if (
+                    app_revision != "unknown"
+                    and browser_revision != "unknown"
+                    and app_revision != browser_revision
+                ):
+                    logging.warning(
+                        "app/browser 镜像 revision 不一致: app=%s, browser=%s；"
+                        "请将两个镜像固定到同一个 tag 或 SHA。",
+                        app_revision,
+                        browser_revision,
+                    )
                 return
             last_error = f"HTTP {response.status_code}: {response.text[:300]}"
         except Exception as e:

@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 from sgcc_ha_bridge.browser import (
     _apply_browser_consistency,
+    _browser_service_start,
     _log_browser_runtime,
     collect_browser_runtime,
     release_driver,
@@ -11,6 +12,58 @@ from sgcc_ha_bridge.browser import (
 
 
 class BrowserConsistencyTestCase(unittest.TestCase):
+    @patch("sgcc_ha_bridge.browser.requests.post")
+    def test_browser_service_start_logs_matching_image_revisions(self, post):
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {
+            "revision": "commit-abc123",
+            "ready": True,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VERSION": "commit-abc123",
+                    "SGCC_BROWSER_SERVICE_TIMEOUT": "1",
+                },
+                clear=True,
+            ),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            _browser_service_start()
+
+        self.assertIn(
+            "app_revision=commit-abc123, browser_revision=commit-abc123, ready=True",
+            "\n".join(logs.output),
+        )
+
+    @patch("sgcc_ha_bridge.browser.requests.post")
+    def test_browser_service_start_warns_on_revision_mismatch(self, post):
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {
+            "revision": "browser-def456",
+            "ready": True,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VERSION": "app-abc123",
+                    "SGCC_BROWSER_SERVICE_TIMEOUT": "1",
+                },
+                clear=True,
+            ),
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            _browser_service_start()
+
+        self.assertIn(
+            "app/browser 镜像 revision 不一致",
+            "\n".join(logs.output),
+        )
+
     def test_consistency_is_applied_before_navigation_for_attached_driver(self):
         driver = Mock()
 

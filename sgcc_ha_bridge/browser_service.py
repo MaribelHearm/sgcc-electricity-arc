@@ -33,6 +33,7 @@ BROWSER_LANGUAGE = os.getenv("BROWSER_LANGUAGE", "zh-CN,zh,en-US,en")
 BROWSER_LANGUAGE_PRIMARY = BROWSER_LANGUAGE.split(",", 1)[0].strip() or "zh-CN"
 WINDOW_SIZE = os.getenv("BROWSER_WINDOW_SIZE", "1280,900")
 START_TIMEOUT = float(os.getenv("SGCC_BROWSER_START_TIMEOUT", "60"))
+REVISION = os.getenv("VERSION", "").strip() or "unknown"
 
 _state_lock = threading.RLock()
 _proc: subprocess.Popen | None = None
@@ -406,6 +407,7 @@ def _status_payload() -> dict:
     proc = _proc
     running = proc is not None and proc.poll() is None
     return {
+        "revision": REVISION,
         "running": running,
         "ready": _ready() if running else False,
         "pid": proc.pid if running else None,

@@ -1,10 +1,13 @@
 ARG BASE_IMAGE=python:3.12.11-slim-bookworm
 FROM ${BASE_IMAGE}
 
+ARG VERSION=unknown
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
-    LANG=C.UTF-8
+    LANG=C.UTF-8 \
+    VERSION=${VERSION}
 
 RUN apt-get --allow-releaseinfo-change update \
     && apt-get install -y --no-install-recommends \

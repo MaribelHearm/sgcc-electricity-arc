@@ -176,6 +176,8 @@ jobs:
           context: .
           file: Dockerfile.browser
           platforms: linux/amd64
+          build-args: |
+            VERSION=${{ github.sha }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-ghcr-browser.outputs.tags }}
           labels: ${{ steps.meta-ghcr-browser.outputs.labels }}
@@ -233,6 +235,8 @@ jobs:
           context: .
           file: Dockerfile.browser
           platforms: linux/amd64
+          build-args: |
+            VERSION=${{ github.sha }}
           push: true
           tags: ${{ steps.meta-aliyun-browser.outputs.tags }}
           labels: ${{ steps.meta-aliyun-browser.outputs.labels }}

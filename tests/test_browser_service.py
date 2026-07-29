@@ -41,6 +41,14 @@ class BrowserServiceConfigTestCase(unittest.TestCase):
         self.assertEqual(browser_service.CDP_HOST, "127.0.0.1")
         self.assertEqual(browser_service.START_URL, "about:blank")
 
+    def test_status_payload_exposes_image_revision(self):
+        browser_service = self._load_browser_service(VERSION="commit-abc123")
+
+        self.assertEqual(
+            browser_service._status_payload()["revision"],
+            "commit-abc123",
+        )
+
     def test_chrome_starts_blank_with_consistent_automation_flags(self):
         browser_service = self._load_browser_service(
             BROWSER_LANGUAGE="zh-CN,zh,en-US,en",
