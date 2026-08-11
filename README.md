@@ -86,6 +86,41 @@ https://github.com/MaribelHearm/sgcc-home-assistant-bridg
 
 完整部署说明见 [DOCS.md](DOCS.md)。
 
+## 常见问题
+
+### ARM64 / aarch64 设备可以运行吗？
+
+目前发布的 app 和 browser-service 镜像仅支持 `linux/amd64`，ARM64 适配正在准备中。
+
+项目的 Python、SQLite 和 MQTT 部分基本可以直接运行在 ARM64 上，主要差异在浏览器环境。amd64 版本使用官方 Google Chrome，ARM64 版本预计使用 Debian Chromium。国网登录会综合判断浏览器和运行环境，因此 ARM64 镜像完成构建后，还需要在真实设备上验证登录和连续抓取。
+
+目前进度：
+
+- [x] 确认 Python 基础镜像和主要依赖支持 ARM64；
+- [x] 确认当前构建阻塞点是 Google Chrome、ChromeDriver 和 amd64-only CI；
+- [x] 确定 amd64 保持 Google Chrome、ARM64 使用 Debian Chromium 的初步方案；
+- [ ] 完成多架构 Dockerfile 和 Buildx CI；
+- [ ] 发布成对的 ARM64 preview 镜像；
+- [ ] 完成真实 ARM64 设备的登录和计划任务测试。
+
+进展和测试反馈见 [Issue #19](https://github.com/MaribelHearm/sgcc-home-assistant-bridg/issues/19)。当前建议在 x86_64 NAS、服务器或电脑上运行正式镜像。
+
+### 项目目前进展到哪里了？
+
+最新正式版本是 `v0.1.9`，已经包含多户号余额刷新、国网登录前端适配、短信二次验证、腾讯文字点选验证码、二维码兜底和 Debug 取证改进。app 和 browser-service 应使用相同的版本 tag；启动日志会检查两者的 revision 是否一致。
+
+### 遇到 RK001 怎么办？
+
+RK001 通常与账号状态、登录频率、网络和浏览器环境共同相关。程序遇到 RK001 后会停止本轮重试并进入冷却，避免连续登录进一步触发风控。
+
+等待账号冷却后再运行，并先确认 app/browser 使用相同版本。相关调查和已完成的改进见 [Issue #23](https://github.com/MaribelHearm/sgcc-home-assistant-bridg/issues/23)。
+
+### 为什么 Home Assistant 里出现两组 MQTT 实体？
+
+`v0.1.8` 起默认保留新版实体和旧版兼容实体，让已有 Lovelace、自动化和脚本可以继续使用。两组实体共享同一份状态数据。
+
+完成实体迁移后，可以按照[实体身份迁移说明](docs/entity-identity-migration.md)清理旧实体。
+
 ## v0.1.5 及更早版本升级：实体 ID 兼容
 
 v0.1.6 引入了防碰撞、隐私化的 canonical 账户身份 `末四位_稳定摘要`。如果旧 Lovelace、自动化或脚本仍引用 v0.1.5 及更早的 MQTT 实体，升级到 v0.1.8 后请先保持默认配置：

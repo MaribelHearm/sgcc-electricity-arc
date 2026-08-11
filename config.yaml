@@ -1,5 +1,5 @@
 name: "SGCC Home Assistant Bridge"
-version: "v0.1.8"
+version: "v0.1.9"
 slug: "sgcc_home_assistant_bridge"
 description: "国家电网 / SGCC / 95598 电费与用电数据 Home Assistant 桥接插件"
 url: "https://github.com/MaribelHearm/sgcc-home-assistant-bridg"
