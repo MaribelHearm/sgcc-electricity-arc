@@ -11,7 +11,7 @@ https://github.com/MaribelHearm/sgcc-home-assistant-bridg
 当前状态：
 
 - 预构建镜像先支持 `amd64`。
-- 当前 Add-on 版本 `v0.1.8`，默认使用官方 Google Chrome `browser-service` 模式。
+- 当前 Add-on 版本 `v0.1.9`，默认使用官方 Google Chrome `browser-service` 模式。
 - Add-on 是单容器部署，镜像内已经包含官方 `google-chrome-stable` 和匹配 ChromeDriver；用户不需要在 HAOS、宿主机或 NAS 上另装 Google Chrome。
 - 已在 HAOS 18.0 / Supervisor 2026.06.2 上验证仓库添加、识别、安装和启动。
 - 真实国网账号抓取、LLM 验证码和 MQTT 发布建议按自己的账号环境再跑一轮。
@@ -157,7 +157,7 @@ canonical MQTT 实体默认使用 `sensor.sgcc_<末四位_稳定摘要>_<key>`�
 ### 安装失败
 
 - 检查 HAOS/Supervisor 能否拉取 GHCR 镜像。
-- 镜像为：`ghcr.io/maribelhearm/sgcc-home-assistant-bridge:v0.1.8`
+- 镜像为：`ghcr.io/maribelhearm/sgcc-home-assistant-bridge:v0.1.9`
 - 国内网络如果拉取 GHCR 很慢，可以先确认 HAOS/Supervisor 能访问 GHCR；当前 Add-on 默认使用 GHCR app 镜像。
 
 ### 验证码/登录未通过

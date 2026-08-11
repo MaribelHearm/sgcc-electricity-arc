@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgcc-home-assistant-bridge"
-version = "0.1.8"
+version = "0.1.9"
 description = "State Grid / SGCC electricity bridge for Home Assistant"
 readme = "README.md"
 requires-python = ">=3.12"

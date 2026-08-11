@@ -1,9 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [v0.1.9] - 2026-08-08
 
 ### Fixed
 
+- 修复多户号切换后余额页面尚未刷新便被读取的问题，避免不同户号复用同一余额或偶发漏抓。
+- 兼容当前国网账号登录面板的前端切换方式，并完善 browser-service 环境和短信二次验证处理。
 - 腾讯验证码只处理当前 viewport 内实际显示的组件，避免把页面预加载在屏幕外的隐藏 scaffold 误判为正在进行的点选或滑块验证。
 - 点选验证码主图和参考图优先从渲染后的元素截图提取，兼容当前 95598 前端使用 `currentSrc`、CSS background 或运行时资源的方式。
 - 短信验证码提交后的腾讯文字点选题不再依赖 `.tencent-captcha-dy__header-answer img`；目标文字直接从可见标题提取，显式元素查找也不再叠加全局 60 秒隐式等待。
@@ -15,6 +17,10 @@
 
 - app/browser 镜像由同一次 CI 注入相同 Git revision；browser-service `/status` 暴露 revision，主程序启动 sidecar 时记录并检查两者是否一致。
 - 登录调试包增加不含凭证的浏览器运行态、请求元数据和关键阶段时间线。
+
+### Documentation
+
+- README 新增常见问题，说明 ARM64 适配进度、RK001 处理方式、当前版本状态和 MQTT 兼容实体。
 
 ### Limitations
 
